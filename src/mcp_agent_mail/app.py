@@ -57,6 +57,7 @@ from .models import (
     ProjectSiblingSuggestion,
     Product,
     ProductProjectLink,
+    ThreadOwnership,
 )
 from .storage import (
     GitIndexLockError,
@@ -177,6 +178,7 @@ CLUSTER_MESSAGING = "messaging"
 CLUSTER_CONTACT = "contact"
 CLUSTER_SEARCH = "search"
 CLUSTER_FILE_RESERVATIONS = "file_reservations"
+CLUSTER_THREADS = "thread_ownership"
 CLUSTER_MACROS = "workflow_macros"
 CLUSTER_BUILD_SLOTS = "build_slots"
 CLUSTER_PRODUCT = "product_bus"
@@ -2794,14 +2796,27 @@ async def update_project_sibling_status(project_id: int, other_id: int, status: 
         }
 
 
-async def _agent_name_exists(project: Project, name: str) -> bool:
-    if project.id is None:
-        raise ValueError("Project must have an id before querying agents.")
+async def _agent_name_exists(name: str, project: Project | None = None) -> bool:
+    """Check if agent name exists globally (or within project if specified).
+
+    With global uniqueness ("Meta Stability Town"), agent names are unique across
+    all projects. The optional project parameter is kept for backward compatibility
+    but is ignored when checking existence.
+    """
     async with get_session() as session:
         result = await session.execute(
-            select(Agent.id).where(Agent.project_id == project.id, func.lower(Agent.name) == name.lower())
+            select(Agent.id).where(func.lower(Agent.name) == name.lower())
         )
         return result.first() is not None
+
+
+async def _get_agent_by_name_global(name: str) -> Agent | None:
+    """Get agent by name globally (across all projects)."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(Agent).where(func.lower(Agent.name) == name.lower())
+        )
+        return result.scalars().first()
 
 
 async def _generate_unique_agent_name(
@@ -2812,7 +2827,7 @@ async def _generate_unique_agent_name(
     archive = await ensure_archive(settings, project.slug)
 
     async def available(candidate: str) -> bool:
-        return not await _agent_name_exists(project, candidate) and not (archive.root / "agents" / candidate).exists()
+        return not await _agent_name_exists(candidate) and not (archive.root / "agents" / candidate).exists()
 
     mode = getattr(settings, "agent_name_enforcement_mode", "coerce").lower()
     if name_hint:
@@ -2920,17 +2935,45 @@ async def _get_or_create_agent(
                 # coerce -> ignore invalid provided name and auto-generate
                 desired_name = await _generate_unique_agent_name(project, settings, None)
     await ensure_schema()
+
+    # Global uniqueness check: if explicit name provided, check if it exists in another project
+    if explicit_name_used:
+        existing_agent = await _get_agent_by_name_global(desired_name)
+        if existing_agent and existing_agent.project_id != project.id:
+            raise ToolExecutionError(
+                "AGENT_NAME_TAKEN",
+                f"Agent name '{desired_name}' is already registered in another project. "
+                f"Agent names are globally unique across all projects ('Meta Stability Town'). "
+                f"Choose a different name or omit 'name' to auto-generate one.",
+                recoverable=True,
+                data={
+                    "provided_name": desired_name,
+                    "valid_examples": ["BlueLake", "GreenCastle", "RedStone"],
+                },
+            )
+
     async with get_session() as session:
         for _attempt in range(5):
-            # Use case-insensitive matching to be consistent with _agent_name_exists() and _get_agent()
+            # Check globally for the agent (names are now globally unique)
             result = await session.execute(
-                select(Agent).where(
-                    cast(Any, Agent.project_id == project.id),
-                    cast(Any, func.lower(Agent.name) == desired_name.lower()),
-                )
+                select(Agent).where(func.lower(Agent.name) == desired_name.lower())
             )
             agent = result.scalars().first()
             if agent:
+                # Agent exists - only allow update if it's in the same project
+                if agent.project_id != project.id:
+                    raise ToolExecutionError(
+                        "AGENT_NAME_TAKEN",
+                        f"Agent name '{desired_name}' is already registered in another project. "
+                        f"Agent names are globally unique across all projects ('Meta Stability Town'). "
+                        f"Choose a different name or omit 'name' to auto-generate one.",
+                        recoverable=True,
+                        data={
+                            "provided_name": desired_name,
+                            "valid_examples": ["BlueLake", "GreenCastle", "RedStone"],
+                        },
+                    )
+                # Same project - update metadata (idempotent behavior)
                 agent.program = program
                 agent.model = model
                 agent.task_description = task_description
@@ -2959,16 +3002,26 @@ async def _get_or_create_agent(
                     session.expunge(candidate)
 
                 if explicit_name_used:
-                    # Another concurrent call created this identity; treat as idempotent update.
+                    # Another concurrent call created this identity globally; check if it's ours
                     result = await session.execute(
-                        select(Agent).where(
-                            cast(Any, Agent.project_id == project.id),
-                            cast(Any, func.lower(Agent.name) == desired_name.lower()),
-                        )
+                        select(Agent).where(func.lower(Agent.name) == desired_name.lower())
                     )
                     agent = result.scalars().first()
                     if agent is None:
                         raise
+                    if agent.project_id != project.id:
+                        raise ToolExecutionError(
+                            "AGENT_NAME_TAKEN",
+                            f"Agent name '{desired_name}' is already registered in another project. "
+                            f"Agent names are globally unique across all projects ('Meta Stability Town'). "
+                            f"Choose a different name or omit 'name' to auto-generate one.",
+                            recoverable=True,
+                            data={
+                                "provided_name": desired_name,
+                                "valid_examples": ["BlueLake", "GreenCastle", "RedStone"],
+                            },
+                        )
+                    # Same project - treat as idempotent update
                     agent.program = program
                     agent.model = model
                     agent.task_description = task_description
@@ -5904,12 +5957,24 @@ def build_mcp_server() -> FastMCP:
                 "count": 0,
             }
 
+        # Auto-claim thread if unclaimed (VLAN-style coordination)
+        auto_claimed = False
+        if project.id is not None and sender.id is not None:
+            try:
+                if not await _is_thread_claimed(project.id, thread_key):
+                    await _claim_thread_internal(project.id, thread_key, sender.id, ttl_seconds=7200)
+                    auto_claimed = True
+                    await ctx.info(f"Auto-claimed thread '{thread_key}' for '{sender.name}'.")
+            except Exception:
+                pass  # Don't fail the reply if auto-claim fails
+
         base_payload = deliveries[0].get("payload") or {}
         primary_payload = dict(base_payload) if isinstance(base_payload, dict) else {}
         primary_payload.setdefault("thread_id", thread_key)
         primary_payload["reply_to"] = message_id
         primary_payload["deliveries"] = deliveries
         primary_payload["count"] = len(deliveries)
+        primary_payload["auto_claimed"] = auto_claimed
         if len(deliveries) == 1:
             attachments = base_payload.get("attachments") if isinstance(base_payload, dict) else None
             if attachments is not None:
@@ -7892,6 +7957,598 @@ def build_mcp_server() -> FastMCP:
         await ctx.info(f"Renewed {len(updated)} file_reservation(s) for '{agent.name}'.")
         return {"renewed": len(updated), "file_reservations": updated}
 
+    # --- Thread ownership (VLAN-style coordination) ------------------------------------------
+    # Agents can claim threads to signal they are working on them
+
+    async def _get_thread_ownership(project_id: int, thread_id: str) -> Optional[ThreadOwnership]:
+        """Fetch thread ownership record if it exists."""
+        async with get_session() as session:
+            result = await session.execute(
+                select(ThreadOwnership).where(
+                    cast(Any, ThreadOwnership.project_id) == project_id,
+                    cast(Any, ThreadOwnership.thread_id) == thread_id,
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def _is_thread_claimed(project_id: int, thread_id: str) -> bool:
+        """Check if a thread is currently claimed (not expired, not released)."""
+        ownership = await _get_thread_ownership(project_id, thread_id)
+        if ownership is None:
+            return False
+        if ownership.released_ts is not None:
+            return False
+        if ownership.expires_ts is not None:
+            now = _naive_utc()
+            if ownership.expires_ts <= now:
+                return False
+        return ownership.owner_agent_id is not None
+
+    async def _claim_thread_internal(
+        project_id: int,
+        thread_id: str,
+        agent_id: int,
+        ttl_seconds: int = 7200,
+    ) -> ThreadOwnership:
+        """Internal helper to claim a thread. Creates or updates ownership record."""
+        now = _naive_utc()
+        expires = now + timedelta(seconds=ttl_seconds)
+
+        async with get_session() as session:
+            existing = await session.execute(
+                select(ThreadOwnership).where(
+                    cast(Any, ThreadOwnership.project_id) == project_id,
+                    cast(Any, ThreadOwnership.thread_id) == thread_id,
+                )
+            )
+            ownership = existing.scalar_one_or_none()
+
+            if ownership is None:
+                ownership = ThreadOwnership(
+                    project_id=project_id,
+                    thread_id=thread_id,
+                    owner_agent_id=agent_id,
+                    claimed_ts=now,
+                    expires_ts=expires,
+                    released_ts=None,
+                )
+                session.add(ownership)
+            else:
+                ownership.owner_agent_id = agent_id
+                ownership.claimed_ts = now
+                ownership.expires_ts = expires
+                ownership.released_ts = None
+                session.add(ownership)
+
+            await session.commit()
+            await session.refresh(ownership)
+            return ownership
+
+    @mcp.tool(name="claim_thread")
+    @_instrument_tool(
+        "claim_thread",
+        cluster=CLUSTER_THREADS,
+        capabilities={"threads", "coordination"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def claim_thread(
+        ctx: Context,
+        project_key: str,
+        thread_id: str,
+        agent_name: str,
+        ttl_seconds: int = 7200,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Claim ownership of a thread for coordination purposes.
+
+        Behavior
+        --------
+        - Fails if the thread is already claimed by another agent (not expired)
+        - Creates or updates a ThreadOwnership record
+        - TTL controls how long the claim lasts before auto-expiring
+
+        Parameters
+        ----------
+        project_key : str
+            Project slug or human key.
+        thread_id : str
+            The thread identifier to claim.
+        agent_name : str
+            Your agent name (must be registered in the project).
+        ttl_seconds : int
+            Time to live for the claim (default 2 hours).
+
+        Returns
+        -------
+        dict
+            { claimed: bool, thread_id, owner, expires_ts }
+
+        Example
+        -------
+        ```json
+        {"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"claim_thread","arguments":{
+          "project_key":"/home/ubuntu","thread_id":"TKT-123","agent_name":"GreenCastle","ttl_seconds":3600
+        }}}
+        ```
+        """
+        project = await _get_project_by_identifier(project_key)
+        agent = await _get_agent(project, agent_name)
+        if project.id is None or agent.id is None:
+            raise ValueError("Project and agent must have ids.")
+
+        await ensure_schema()
+
+        # Check if already claimed by someone else
+        existing = await _get_thread_ownership(project.id, thread_id)
+        if existing is not None and existing.released_ts is None:
+            now = _naive_utc()
+            if existing.expires_ts is not None and existing.expires_ts > now:
+                if existing.owner_agent_id != agent.id:
+                    # Get owner name
+                    async with get_session() as session:
+                        owner_row = await session.execute(
+                            select(Agent.name).where(cast(Any, Agent.id) == existing.owner_agent_id)
+                        )
+                        owner_name = owner_row.scalar_one_or_none() or "unknown"
+                    raise ToolExecutionError(
+                        "THREAD_ALREADY_CLAIMED",
+                        f"Thread '{thread_id}' is already claimed by '{owner_name}' until {_iso(existing.expires_ts)}.",
+                        recoverable=True,
+                        data={
+                            "thread_id": thread_id,
+                            "current_owner": owner_name,
+                            "expires_ts": _iso(existing.expires_ts),
+                        },
+                    )
+
+        ownership = await _claim_thread_internal(project.id, thread_id, agent.id, ttl_seconds)
+        await ctx.info(f"Thread '{thread_id}' claimed by '{agent_name}' until {_iso(ownership.expires_ts)}.")
+
+        return {
+            "claimed": True,
+            "thread_id": thread_id,
+            "owner": agent_name,
+            "claimed_ts": _iso(ownership.claimed_ts),
+            "expires_ts": _iso(ownership.expires_ts),
+        }
+
+    @mcp.tool(name="release_thread")
+    @_instrument_tool(
+        "release_thread",
+        cluster=CLUSTER_THREADS,
+        capabilities={"threads", "coordination"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def release_thread(
+        ctx: Context,
+        project_key: str,
+        thread_id: str,
+        agent_name: str,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Release ownership of a thread you own.
+
+        Parameters
+        ----------
+        project_key : str
+            Project slug or human key.
+        thread_id : str
+            The thread identifier to release.
+        agent_name : str
+            Your agent name (must own the thread).
+
+        Returns
+        -------
+        dict
+            { released: bool, thread_id, released_ts }
+
+        Example
+        -------
+        ```json
+        {"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"release_thread","arguments":{
+          "project_key":"/home/ubuntu","thread_id":"TKT-123","agent_name":"GreenCastle"
+        }}}
+        ```
+        """
+        project = await _get_project_by_identifier(project_key)
+        agent = await _get_agent(project, agent_name)
+        if project.id is None or agent.id is None:
+            raise ValueError("Project and agent must have ids.")
+
+        await ensure_schema()
+        now = _naive_utc()
+
+        async with get_session() as session:
+            result = await session.execute(
+                select(ThreadOwnership).where(
+                    cast(Any, ThreadOwnership.project_id) == project.id,
+                    cast(Any, ThreadOwnership.thread_id) == thread_id,
+                )
+            )
+            ownership = result.scalar_one_or_none()
+
+        if ownership is None:
+            return {"released": False, "thread_id": thread_id, "reason": "not_found"}
+
+        if ownership.owner_agent_id != agent.id:
+            raise ToolExecutionError(
+                "NOT_OWNER",
+                f"Thread '{thread_id}' is not owned by '{agent_name}'.",
+                recoverable=True,
+                data={"thread_id": thread_id},
+            )
+
+        async with get_session() as session:
+            await session.execute(
+                update(ThreadOwnership)
+                .where(cast(Any, ThreadOwnership.id) == ownership.id)
+                .values(released_ts=now)
+            )
+            await session.commit()
+
+        await ctx.info(f"Thread '{thread_id}' released by '{agent_name}'.")
+        return {"released": True, "thread_id": thread_id, "released_ts": _iso(now)}
+
+    @mcp.tool(name="renew_thread_claim")
+    @_instrument_tool(
+        "renew_thread_claim",
+        cluster=CLUSTER_THREADS,
+        capabilities={"threads", "coordination"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def renew_thread_claim(
+        ctx: Context,
+        project_key: str,
+        thread_id: str,
+        agent_name: str,
+        extend_seconds: int = 3600,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Extend the TTL on a thread claim you own.
+
+        Parameters
+        ----------
+        project_key : str
+            Project slug or human key.
+        thread_id : str
+            The thread identifier to renew.
+        agent_name : str
+            Your agent name (must own the thread).
+        extend_seconds : int
+            Seconds to extend from the later of now or current expiry (default 1 hour).
+
+        Returns
+        -------
+        dict
+            { renewed: bool, thread_id, old_expires_ts, new_expires_ts }
+
+        Example
+        -------
+        ```json
+        {"jsonrpc":"2.0","id":"3","method":"tools/call","params":{"name":"renew_thread_claim","arguments":{
+          "project_key":"/home/ubuntu","thread_id":"TKT-123","agent_name":"GreenCastle","extend_seconds":7200
+        }}}
+        ```
+        """
+        project = await _get_project_by_identifier(project_key)
+        agent = await _get_agent(project, agent_name)
+        if project.id is None or agent.id is None:
+            raise ValueError("Project and agent must have ids.")
+
+        await ensure_schema()
+        now = datetime.now(timezone.utc)
+        bump = max(60, int(extend_seconds))
+
+        async with get_session() as session:
+            result = await session.execute(
+                select(ThreadOwnership).where(
+                    cast(Any, ThreadOwnership.project_id) == project.id,
+                    cast(Any, ThreadOwnership.thread_id) == thread_id,
+                )
+            )
+            ownership = result.scalar_one_or_none()
+
+        if ownership is None:
+            return {"renewed": False, "thread_id": thread_id, "reason": "not_found"}
+
+        if ownership.owner_agent_id != agent.id:
+            raise ToolExecutionError(
+                "NOT_OWNER",
+                f"Thread '{thread_id}' is not owned by '{agent_name}'.",
+                recoverable=True,
+                data={"thread_id": thread_id},
+            )
+
+        if ownership.released_ts is not None:
+            return {"renewed": False, "thread_id": thread_id, "reason": "already_released"}
+
+        old_exp = ownership.expires_ts
+        if old_exp is not None and getattr(old_exp, "tzinfo", None) is None:
+            old_exp = old_exp.replace(tzinfo=timezone.utc)
+        base = old_exp if old_exp and old_exp > now else now
+        new_exp = _naive_utc(base + timedelta(seconds=bump))
+
+        async with get_session() as session:
+            await session.execute(
+                update(ThreadOwnership)
+                .where(cast(Any, ThreadOwnership.id) == ownership.id)
+                .values(expires_ts=new_exp)
+            )
+            await session.commit()
+
+        await ctx.info(f"Thread '{thread_id}' claim renewed for '{agent_name}' until {_iso(new_exp)}.")
+        return {
+            "renewed": True,
+            "thread_id": thread_id,
+            "old_expires_ts": _iso(old_exp) if old_exp else None,
+            "new_expires_ts": _iso(new_exp),
+        }
+
+    @mcp.tool(name="list_threads")
+    @_instrument_tool(
+        "list_threads",
+        cluster=CLUSTER_THREADS,
+        capabilities={"threads", "read"},
+        project_arg="project_key",
+    )
+    async def list_threads(
+        ctx: Context,
+        project_key: str,
+        filter: str = "all",
+        agent_name: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        List threads with their claim status.
+
+        Parameters
+        ----------
+        project_key : str
+            Project slug or human key.
+        filter : str
+            One of: all, claimed, unclaimed, mine, expired (default: all).
+        agent_name : Optional[str]
+            Required when filter is 'mine'.
+
+        Returns
+        -------
+        dict
+            { threads: [{thread_id, owner, claimed_ts, expires_ts, status}] }
+
+        Example
+        -------
+        ```json
+        {"jsonrpc":"2.0","id":"4","method":"tools/call","params":{"name":"list_threads","arguments":{
+          "project_key":"/home/ubuntu","filter":"unclaimed"
+        }}}
+        ```
+        """
+        project = await _get_project_by_identifier(project_key)
+        if project.id is None:
+            raise ValueError("Project must have an id.")
+
+        await ensure_schema()
+        now = _naive_utc()
+
+        agent_id: Optional[int] = None
+        if filter == "mine":
+            if not agent_name:
+                raise ToolExecutionError(
+                    "MISSING_AGENT",
+                    "agent_name is required when filter='mine'.",
+                    recoverable=True,
+                    data={"filter": filter},
+                )
+            agent = await _get_agent(project, agent_name)
+            agent_id = agent.id
+
+        # Get all threads that have messages in this project
+        async with get_session() as session:
+            # Get distinct thread_ids from messages
+            thread_rows = await session.execute(
+                select(Message.thread_id)
+                .where(
+                    cast(Any, Message.project_id) == project.id,
+                    cast(Any, Message.thread_id).isnot(None),
+                )
+                .distinct()
+            )
+            all_thread_ids = {row[0] for row in thread_rows.all() if row[0]}
+
+            # Get ownership records
+            ownership_rows = await session.execute(
+                select(ThreadOwnership, Agent.name)
+                .outerjoin(Agent, cast(Any, ThreadOwnership.owner_agent_id) == Agent.id)
+                .where(cast(Any, ThreadOwnership.project_id) == project.id)
+            )
+            ownership_map: dict[str, tuple[ThreadOwnership, Optional[str]]] = {}
+            for row in ownership_rows.all():
+                ownership, owner_name = row
+                ownership_map[ownership.thread_id] = (ownership, owner_name)
+
+        results: list[dict[str, Any]] = []
+        for thread_id in sorted(all_thread_ids):
+            ownership_data = ownership_map.get(thread_id)
+
+            if ownership_data:
+                ownership, owner_name = ownership_data
+                is_released = ownership.released_ts is not None
+                is_expired = ownership.expires_ts is not None and ownership.expires_ts <= now
+
+                if is_released or is_expired:
+                    status = "expired" if is_expired else "released"
+                    owner_name = None
+                else:
+                    status = "claimed"
+            else:
+                ownership = None
+                owner_name = None
+                status = "unclaimed"
+
+            # Apply filter
+            if filter == "claimed" and status != "claimed":
+                continue
+            if filter == "unclaimed" and status != "unclaimed":
+                continue
+            if filter == "expired" and status != "expired":
+                continue
+            if filter == "mine" and (ownership is None or ownership.owner_agent_id != agent_id):
+                continue
+
+            entry: dict[str, Any] = {
+                "thread_id": thread_id,
+                "status": status,
+                "owner": owner_name,
+            }
+            if ownership:
+                entry["claimed_ts"] = _iso(ownership.claimed_ts) if ownership.claimed_ts else None
+                entry["expires_ts"] = _iso(ownership.expires_ts) if ownership.expires_ts else None
+                if ownership.released_ts:
+                    entry["released_ts"] = _iso(ownership.released_ts)
+
+            results.append(entry)
+
+        return {"threads": results, "count": len(results)}
+
+    @mcp.tool(name="force_release_thread")
+    @_instrument_tool(
+        "force_release_thread",
+        cluster=CLUSTER_THREADS,
+        capabilities={"threads", "coordination"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def force_release_thread(
+        ctx: Context,
+        project_key: str,
+        thread_id: str,
+        agent_name: str,
+        note: str = "",
+        notify_previous: bool = True,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Force-release an expired or stale thread claim.
+
+        Use this when a thread appears abandoned (expired TTL). Optionally
+        notifies the previous owner.
+
+        Parameters
+        ----------
+        project_key : str
+            Project slug or human key.
+        thread_id : str
+            The thread to force-release.
+        agent_name : str
+            Your agent name (who is forcing the release).
+        note : str
+            Optional note to include in notification.
+        notify_previous : bool
+            Whether to notify the previous owner (default True).
+
+        Returns
+        -------
+        dict
+            { released: bool, thread_id, previous_owner, released_ts }
+
+        Example
+        -------
+        ```json
+        {"jsonrpc":"2.0","id":"5","method":"tools/call","params":{"name":"force_release_thread","arguments":{
+          "project_key":"/home/ubuntu","thread_id":"TKT-123","agent_name":"BlueLake","note":"Taking over stale thread"
+        }}}
+        ```
+        """
+        project = await _get_project_by_identifier(project_key)
+        actor = await _get_agent(project, agent_name)
+        if project.id is None:
+            raise ValueError("Project must have an id.")
+
+        await ensure_schema()
+        now = _naive_utc()
+
+        async with get_session() as session:
+            result = await session.execute(
+                select(ThreadOwnership, Agent.name)
+                .outerjoin(Agent, cast(Any, ThreadOwnership.owner_agent_id) == Agent.id)
+                .where(
+                    cast(Any, ThreadOwnership.project_id) == project.id,
+                    cast(Any, ThreadOwnership.thread_id) == thread_id,
+                )
+            )
+            row = result.first()
+
+        if not row:
+            return {"released": False, "thread_id": thread_id, "reason": "not_found"}
+
+        ownership, previous_owner_name = row
+
+        if ownership.released_ts is not None:
+            return {"released": False, "thread_id": thread_id, "reason": "already_released"}
+
+        # Check if expired - only allow force release if expired
+        if ownership.expires_ts is not None and ownership.expires_ts > now:
+            raise ToolExecutionError(
+                "CLAIM_STILL_ACTIVE",
+                f"Thread '{thread_id}' claim has not expired yet (expires {_iso(ownership.expires_ts)}). "
+                "Wait for expiry or ask the owner to release it.",
+                recoverable=True,
+                data={"thread_id": thread_id, "expires_ts": _iso(ownership.expires_ts)},
+            )
+
+        async with get_session() as session:
+            await session.execute(
+                update(ThreadOwnership)
+                .where(cast(Any, ThreadOwnership.id) == ownership.id)
+                .values(released_ts=now)
+            )
+            await session.commit()
+
+        await ctx.info(f"Force-released thread '{thread_id}' (was held by '{previous_owner_name or 'unknown'}').")
+
+        notified = False
+        if notify_previous and previous_owner_name and previous_owner_name != agent_name:
+            body_lines = [
+                f"Hi {previous_owner_name},",
+                "",
+                f"I force-released your claim on thread `{thread_id}` because it had expired.",
+            ]
+            if note:
+                body_lines.extend(["", f"Note: {note.strip()}"])
+            body_lines.extend([
+                "",
+                "If you still need to work on this thread, please re-claim it with `claim_thread`.",
+            ])
+            try:
+                from fastmcp.tools.tool import FunctionTool
+                send_tool = cast(FunctionTool, cast(Any, send_message))
+                await send_tool.run({
+                    "ctx": ctx,
+                    "project_key": project_key,
+                    "sender_name": agent_name,
+                    "to": [previous_owner_name],
+                    "subject": f"[threads] Released expired claim on {thread_id}",
+                    "body_md": "\n".join(body_lines),
+                    "format": "json",
+                })
+                notified = True
+            except Exception:
+                notified = False
+
+        return {
+            "released": True,
+            "thread_id": thread_id,
+            "previous_owner": previous_owner_name,
+            "released_ts": _iso(now),
+            "notified": notified,
+        }
+
     # --- Build slots (coarse concurrency control) --------------------------------------------
     # Only registered when WORKTREES_ENABLED=1 to reduce token overhead for single-worktree setups
 
@@ -9313,6 +9970,147 @@ def build_mcp_server() -> FastMCP:
             payload,
             settings=settings,
             resource_name="resource://file_reservations/{slug}",
+            format_value=format_value,
+        )
+
+    @mcp.resource("resource://threads/{project_key}{?filter,agent,format}", mime_type="application/json")
+    async def threads_resource(
+        project_key: str,
+        filter: str = "all",
+        agent: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        List threads with their claim status for a project.
+
+        Why this exists
+        ---------------
+        - Thread ownership helps agents coordinate on work without duplicating effort.
+        - Surfacing claim status enables onboarding flows to show what's being worked on.
+
+        Parameters
+        ----------
+        project_key : str
+            Project slug or human key.
+        filter : str
+            One of: all, claimed, unclaimed, expired (default: all).
+        agent : Optional[str]
+            When provided with filter='mine', shows threads claimed by this agent.
+
+        Returns
+        -------
+        dict
+            { project, threads: [{thread_id, status, owner, claimed_ts, expires_ts}], counts }
+
+        Example
+        -------
+        ```json
+        {"jsonrpc":"2.0","id":"r4c","method":"resources/read","params":{"uri":"resource://threads/backend-abc123?filter=unclaimed"}}
+        ```
+        """
+        slug_value, query_params = _split_slug_and_query(project_key)
+        format_value = format or query_params.get("format")
+        filter_value = filter
+        if "filter" in query_params:
+            filter_value = query_params["filter"]
+        agent_value = agent
+        if "agent" in query_params:
+            agent_value = query_params["agent"]
+
+        project = await _get_project_by_identifier(slug_value)
+        await ensure_schema()
+        if project.id is None:
+            raise ValueError("Project must have an id before listing threads.")
+
+        now = _naive_utc()
+
+        agent_id: Optional[int] = None
+        if filter_value == "mine" and agent_value:
+            agent_obj = await _get_agent(project, agent_value)
+            agent_id = agent_obj.id
+
+        async with get_session() as session:
+            # Get distinct thread_ids from messages
+            thread_rows = await session.execute(
+                select(Message.thread_id)
+                .where(
+                    cast(Any, Message.project_id) == project.id,
+                    cast(Any, Message.thread_id).isnot(None),
+                )
+                .distinct()
+            )
+            all_thread_ids = {row[0] for row in thread_rows.all() if row[0]}
+
+            # Get ownership records
+            ownership_rows = await session.execute(
+                select(ThreadOwnership, Agent.name)
+                .outerjoin(Agent, cast(Any, ThreadOwnership.owner_agent_id) == Agent.id)
+                .where(cast(Any, ThreadOwnership.project_id) == project.id)
+            )
+            ownership_map: dict[str, tuple[ThreadOwnership, Optional[str]]] = {}
+            for row in ownership_rows.all():
+                ownership, owner_name = row
+                ownership_map[ownership.thread_id] = (ownership, owner_name)
+
+        results: list[dict[str, Any]] = []
+        counts = {"total": 0, "claimed": 0, "unclaimed": 0, "expired": 0}
+
+        for thread_id in sorted(all_thread_ids):
+            ownership_data = ownership_map.get(thread_id)
+
+            if ownership_data:
+                ownership, owner_name = ownership_data
+                is_released = ownership.released_ts is not None
+                is_expired = ownership.expires_ts is not None and ownership.expires_ts <= now
+
+                if is_released or is_expired:
+                    status = "expired" if is_expired else "released"
+                    owner_display = None
+                    counts["expired"] += 1
+                else:
+                    status = "claimed"
+                    owner_display = owner_name
+                    counts["claimed"] += 1
+            else:
+                ownership = None
+                owner_display = None
+                status = "unclaimed"
+                counts["unclaimed"] += 1
+
+            counts["total"] += 1
+
+            # Apply filter
+            if filter_value == "claimed" and status != "claimed":
+                continue
+            if filter_value == "unclaimed" and status != "unclaimed":
+                continue
+            if filter_value == "expired" and status not in ("expired", "released"):
+                continue
+            if filter_value == "mine" and (ownership is None or ownership.owner_agent_id != agent_id):
+                continue
+
+            entry: dict[str, Any] = {
+                "thread_id": thread_id,
+                "status": status,
+                "owner": owner_display,
+            }
+            if ownership:
+                entry["claimed_ts"] = _iso(ownership.claimed_ts) if ownership.claimed_ts else None
+                entry["expires_ts"] = _iso(ownership.expires_ts) if ownership.expires_ts else None
+                if ownership.released_ts:
+                    entry["released_ts"] = _iso(ownership.released_ts)
+
+            results.append(entry)
+
+        payload = {
+            "project": project.human_key,
+            "threads": results,
+            "counts": counts,
+        }
+        return _apply_resource_output_format(
+            payload,
+            settings=settings,
+            resource_name="resource://threads/{project_key}",
             format_value=format_value,
         )
 

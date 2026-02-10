@@ -56,7 +56,7 @@ class ProductProjectLink(SQLModel, table=True):
 
 class Agent(SQLModel, table=True):
     __tablename__ = "agents"
-    __table_args__ = (UniqueConstraint("project_id", "name", name="uq_agent_project_name"),)
+    __table_args__ = (UniqueConstraint("name", name="uq_agent_name_global"),)
 
     id: Optional[int] = Field(default=None, primary_key=True)
     project_id: int = Field(foreign_key="projects.id", index=True)
@@ -160,3 +160,25 @@ class ProjectSiblingSuggestion(SQLModel, table=True):
     evaluated_ts: datetime = Field(default_factory=_utcnow_naive)
     confirmed_ts: Optional[datetime] = Field(default=None)
     dismissed_ts: Optional[datetime] = Field(default=None)
+
+
+class ThreadOwnership(SQLModel, table=True):
+    """Track thread ownership/claims for VLAN-style agent coordination.
+
+    Agents can claim threads to signal they are working on them, preventing
+    duplicate work and enabling clear coordination.
+    """
+
+    __tablename__ = "thread_ownership"
+    __table_args__ = (
+        UniqueConstraint("project_id", "thread_id", name="uq_thread_ownership"),
+        Index("idx_thread_ownership_project_expires", "project_id", "expires_ts"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    thread_id: str = Field(max_length=128, index=True)
+    owner_agent_id: Optional[int] = Field(default=None, foreign_key="agents.id", index=True)
+    claimed_ts: Optional[datetime] = Field(default=None)
+    expires_ts: Optional[datetime] = Field(default=None)
+    released_ts: Optional[datetime] = Field(default=None)
