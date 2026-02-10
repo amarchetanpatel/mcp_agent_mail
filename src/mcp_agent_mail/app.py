@@ -3774,7 +3774,7 @@ async def _list_inbox(
         if urgent_only:
             stmt = stmt.where(cast(Any, Message.importance).in_(["high", "urgent"]))
         if unread_only:
-            stmt = stmt.where(MessageRecipient.read_ts == None)
+            stmt = stmt.where(MessageRecipient.read_ts.is_(None))
         if since_ts:
             since_dt = _parse_iso(since_ts)
             if since_dt:
