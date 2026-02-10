@@ -3753,6 +3753,7 @@ async def _list_inbox(
     urgent_only: bool,
     include_bodies: bool,
     since_ts: Optional[str],
+    unread_only: bool = False,
 ) -> list[dict[str, Any]]:
     if project.id is None or agent.id is None:
         raise ValueError("Project and agent must have ids before listing inbox.")
@@ -3772,6 +3773,8 @@ async def _list_inbox(
         )
         if urgent_only:
             stmt = stmt.where(cast(Any, Message.importance).in_(["high", "urgent"]))
+        if unread_only:
+            stmt = stmt.where(MessageRecipient.read_ts == None)
         if since_ts:
             since_dt = _parse_iso(since_ts)
             if since_dt:
@@ -6300,6 +6303,7 @@ def build_mcp_server() -> FastMCP:
         urgent_only: bool = False,
         include_bodies: bool = False,
         since_ts: Optional[str] = None,
+        unread_only: bool = False,
         format: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """
@@ -6308,6 +6312,7 @@ def build_mcp_server() -> FastMCP:
         Filters
         -------
         - `urgent_only`: only messages with importance in {high, urgent}
+        - `unread_only`: only messages that have not been marked as read
         - `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned
         - `limit`: max number of messages (default 20)
         - `include_bodies`: include full Markdown bodies in the payloads
@@ -6360,7 +6365,7 @@ def build_mcp_server() -> FastMCP:
         try:
             project = await _get_project_by_identifier(project_key)
             agent = await _get_agent(project, agent_name)
-            items = await _list_inbox(project, agent, limit, urgent_only, include_bodies, since_ts)
+            items = await _list_inbox(project, agent, limit, urgent_only, include_bodies, since_ts, unread_only)
             if settings.notifications.enabled:
                 with suppress(Exception):
                     await clear_notification_signal(settings, project.slug, agent.name)
@@ -7073,7 +7078,7 @@ def build_mcp_server() -> FastMCP:
                     key = f"t{idx}"
                     params[key] = f"%{_like_escape(term)}%"
                     clauses.append(
-                        f"(m.subject LIKE :{key} ESCAPE '\\\\' OR m.body_md LIKE :{key} ESCAPE '\\\\')"
+                        f"(m.subject LIKE :{key} ESCAPE '\\' OR m.body_md LIKE :{key} ESCAPE '\\')"
                     )
                 where_clause = " AND ".join(clauses)
                 result = await session.execute(
@@ -8973,7 +8978,7 @@ def build_mcp_server() -> FastMCP:
                             key = f"t{idx}"
                             params[key] = f"%{_like_escape(term)}%"
                             clauses.append(
-                                f"(m.subject LIKE :{key} ESCAPE '\\\\' OR m.body_md LIKE :{key} ESCAPE '\\\\')"
+                                f"(m.subject LIKE :{key} ESCAPE '\\' OR m.body_md LIKE :{key} ESCAPE '\\')"
                             )
                         where_clause = " AND ".join(clauses)
                         result = await session.execute(
