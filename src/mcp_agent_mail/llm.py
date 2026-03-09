@@ -20,7 +20,7 @@ import structlog
 from decouple import Config as DecoupleConfig, RepositoryEnv
 from litellm.types.caching import LiteLLMCacheType
 
-from .config import get_settings
+from .config import get_settings, resolve_env_file_path
 
 _init_lock = asyncio.Lock()
 _initialized: bool = False
@@ -217,9 +217,9 @@ def _bridge_provider_env() -> None:
     """
     from decouple import RepositoryEmpty
 
-    # Gracefully handle missing .env file (e.g., in CI/tests)
+    # Gracefully handle missing env file (e.g., in CI/tests)
     try:
-        cfg = DecoupleConfig(RepositoryEnv(".env"))
+        cfg = DecoupleConfig(RepositoryEnv(str(resolve_env_file_path())))
     except FileNotFoundError:
         cfg = DecoupleConfig(RepositoryEmpty())
 
@@ -253,4 +253,3 @@ def _bridge_provider_env() -> None:
             val = _get_from_any(*aliases)
             if val:
                 os.environ[canonical] = val
-

@@ -11,6 +11,7 @@ import importlib
 import json
 import logging
 import re
+import subprocess
 from collections.abc import MutableMapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import NoResultFound
+from sqlalchemy.engine import make_url
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import Receive, Scope, Send
 
@@ -103,6 +105,55 @@ _LIKE_ESCAPE_CHAR = "!"
 def _like_escape(term: str) -> str:
     """Escape LIKE wildcards for literal substring matching."""
     return term.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _git_commit_sha(repo_root: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--short=12", "HEAD"],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
+
+
+def _resolve_database_target(database_url: str, *, cwd: Path) -> str:
+    """Render the effective database target for startup diagnostics."""
+    try:
+        url = make_url(database_url)
+    except Exception:
+        return database_url
+    if not url.drivername.startswith("sqlite"):
+        return database_url
+
+    database = url.database or ""
+    if database == ":memory:":
+        return database
+    if database.startswith("/"):
+        return str(Path(database).resolve())
+    return str((cwd / database).resolve())
+
+
+def _startup_runtime_metadata(settings: Settings) -> dict[str, Any]:
+    repo_root = _repo_root()
+    return {
+        "repo_root": str(repo_root),
+        "release_commit": _git_commit_sha(repo_root),
+        "env_file_path": settings.env_file_path,
+        "database_url": settings.database.url,
+        "database_target": _resolve_database_target(settings.database.url, cwd=repo_root),
+        "http_host": settings.http.host,
+        "http_port": settings.http.port,
+        "http_path": settings.http.path,
+    }
 
 
 def _configure_logging(settings: Settings) -> None:
@@ -568,6 +619,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
     # Background workers lifecycle
     async def _startup() -> None:  # pragma: no cover - service lifecycle
+        structlog.get_logger("startup").info("service_runtime_contract", **_startup_runtime_metadata(settings))
         # Note: no early return here -- the FD health monitor always runs,
         # even when optional workers are disabled by feature flags.
 

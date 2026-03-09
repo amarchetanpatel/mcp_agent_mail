@@ -2432,6 +2432,14 @@ sudo systemctl status mcp-agent-mail
 
 Optional (non-journald log rotation): install `deploy/logrotate/mcp-agent-mail` into `/etc/logrotate.d/` and write logs to `/var/log/mcp-agent-mail/*.log` via your process manager or app config.
 
+For a conservative single-host deploy/rollback workflow, use:
+
+- `scripts/deploy.sh`
+- `scripts/smoke_check.sh`
+- `scripts/rollback.sh`
+
+For the operational rationale behind this deployment model, see [docs/DEPLOYMENT_ARCHITECTURE_AND_HARDENING.md](docs/DEPLOYMENT_ARCHITECTURE_AND_HARDENING.md).
+
 See `deploy/gunicorn.conf.py` for a starter configuration. For project direction and planned areas, read `project_idea_and_guide.md`.
 
 ## CLI Commands

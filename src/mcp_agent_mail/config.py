@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -14,18 +15,26 @@ from decouple import (
 )
 
 _DOTENV_PATH: Final[Path] = Path(".env")
+_ENV_FILE_ENVVAR: Final[str] = "MCP_AGENT_MAIL_ENV_FILE"
+
+def resolve_env_file_path() -> Path:
+    """Resolve the env file used for decouple-backed fallback lookups."""
+    configured = os.environ.get(_ENV_FILE_ENVVAR, "").strip()
+    return Path(configured) if configured else _DOTENV_PATH
 
 
-def _build_decouple_config() -> DecoupleConfig:
-    # Gracefully handle missing .env (e.g., in CI/tests) by falling back to an empty repository.
+@lru_cache(maxsize=1)
+def _load_decouple_config() -> DecoupleConfig:
+    # Gracefully handle missing env file (e.g., in CI/tests) by falling back to an empty repository.
     try:
-        return DecoupleConfig(RepositoryEnv(str(_DOTENV_PATH)))
+        return DecoupleConfig(RepositoryEnv(str(resolve_env_file_path())))
     except FileNotFoundError:
-        # Fall back to an empty repository (reads only os.environ; all .env lookups use defaults)
+        # Fall back to an empty repository (reads only os.environ; all env lookups use defaults)
         return DecoupleConfig(RepositoryEmpty())
 
 
-_decouple_config: Final[DecoupleConfig] = _build_decouple_config()
+def _decouple_config(name: str, default: str = "") -> str:
+    return _load_decouple_config()(name, default=default)
 
 
 @dataclass(slots=True, frozen=True)
@@ -177,6 +186,7 @@ class Settings:
     """Top-level application settings."""
 
     environment: str
+    env_file_path: str
     # Global gate for worktree-friendly behavior (opt-in; default False)
     worktrees_enabled: bool
     # Identity preferences (phase 1: read-only; behavior remains 'dir' unless features enabled)
@@ -410,6 +420,7 @@ def get_settings() -> Settings:
 
     return Settings(
         environment=environment,
+        env_file_path=str(resolve_env_file_path()),
         # Gate: allow either legacy WORKTREES_ENABLED or new GIT_IDENTITY_ENABLED to enable features
         worktrees_enabled=(
             _bool(_decouple_config("WORKTREES_ENABLED", default="false"), default=False)
@@ -484,3 +495,6 @@ def clear_settings_cache() -> None:
     cache_clear = getattr(cast(_CacheClearable, get_settings), "cache_clear", None)
     if callable(cache_clear):
         cache_clear()
+    decouple_cache_clear = getattr(cast(_CacheClearable, _load_decouple_config), "cache_clear", None)
+    if callable(decouple_cache_clear):
+        decouple_cache_clear()

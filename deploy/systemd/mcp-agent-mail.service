@@ -1,12 +1,16 @@
 [Unit]
 Description=MCP Agent Mail HTTP Service
-After=network.target postgresql.service
+After=network.target
 
 [Service]
 EnvironmentFile=/etc/mcp-agent-mail.env
+Environment=MCP_AGENT_MAIL_ENV_FILE=/etc/mcp-agent-mail.env
 Type=simple
-WorkingDirectory=/opt/mcp-agent-mail
-ExecStart=/usr/bin/uvicorn mcp_agent_mail.http:build_http_app --factory --host 0.0.0.0 --port 8765
+WorkingDirectory=/opt/mcp-agent-mail/current
+ExecStartPre=/usr/bin/test -f /etc/mcp-agent-mail.env
+ExecStartPre=/usr/bin/test -d /opt/mcp-agent-mail/current
+ExecStartPre=/usr/bin/test -x /opt/mcp-agent-mail/current/.venv/bin/python
+ExecStart=/opt/mcp-agent-mail/current/.venv/bin/python -m mcp_agent_mail.http --host 127.0.0.1 --port 8765
 Restart=always
 RestartSec=5
 User=appuser

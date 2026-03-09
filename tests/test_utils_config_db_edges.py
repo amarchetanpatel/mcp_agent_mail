@@ -30,6 +30,17 @@ def test_database_pool_size_default_is_50(monkeypatch):
     assert s.database.pool_size == 50
 
 
+def test_config_uses_explicit_env_file(monkeypatch, tmp_path):
+    env_file = tmp_path / "service.env"
+    env_file.write_text("HTTP_PORT=9988\n", encoding="utf-8")
+    monkeypatch.setenv("MCP_AGENT_MAIL_ENV_FILE", str(env_file))
+    monkeypatch.delenv("HTTP_PORT", raising=False)
+    clear_settings_cache()
+    s = get_settings()
+    assert s.env_file_path == str(env_file)
+    assert s.http.port == 9988
+
+
 def test_db_engine_reset_and_reinit(isolated_env):
     # Reset and ensure engine can be re-initialized and schema ensured
     reset_database_state()
@@ -37,4 +48,3 @@ def test_db_engine_reset_and_reinit(isolated_env):
     _ = get_engine()
     # Ensure schema executes without error
     asyncio.run(ensure_schema())
-

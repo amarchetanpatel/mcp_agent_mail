@@ -142,3 +142,31 @@ async def test_thread_claim_lifecycle_and_reply_auto_claim(isolated_env):
         )
         assert released.data.get("released") is True
 
+
+@pytest.mark.asyncio
+async def test_fetch_inbox_with_path_project_key(isolated_env):
+    server = build_mcp_server()
+    project_key = "/tmp/path-key-project"
+
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": project_key,
+                "program": "codex-cli",
+                "model": "gpt5-codex",
+                "name": "BlueLake",
+            },
+        )
+
+        inbox = await client.call_tool(
+            "fetch_inbox",
+            {
+                "project_key": project_key,
+                "agent_name": "BlueLake",
+                "limit": 1,
+            },
+        )
+        assert isinstance(inbox.data, list)
+        assert inbox.data == []

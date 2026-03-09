@@ -1,60 +1,149 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Minimal deploy helper: deps, env copy (if missing), migrate, optional guard install
-
-if ! command -v uv >/dev/null 2>&1; then
-  echo "uv is required. Install via https://github.com/astral-sh/uv" >&2
-  exit 1
-fi
-
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
-cd "$ROOT_DIR"
+SERVICE_NAME="${SERVICE_NAME:-mcp-agent-mail}"
+APP_DIR="${APP_DIR:-$ROOT_DIR}"
+ENV_FILE="${ENV_FILE:-/etc/mcp-agent-mail.env}"
+UNIT_PATH="${UNIT_PATH:-/etc/systemd/system/${SERVICE_NAME}.service}"
+RUN_USER="${RUN_USER:-$(id -un)}"
+RUN_GROUP="${RUN_GROUP:-$(id -gn)}"
+HOST="${HOST:-127.0.0.1}"
+PORT="${PORT:-8765}"
+MCP_PATH="${MCP_PATH:-/api/}"
+SMOKE_PROJECT_KEY="${SMOKE_PROJECT_KEY:-}"
+SMOKE_AGENT_NAME="${SMOKE_AGENT_NAME:-}"
+TIMESTAMP=$(date -u +"%Y%m%dT%H%M%SZ")
+UNIT_BACKUP="${UNIT_PATH}.bak-${TIMESTAMP}"
 
-echo "==> Installing runtime dependencies"
-uv sync
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
 
-if [ ! -f .env ]; then
-  echo "==> No .env found; copying from deploy/env/production.env"
-  cp deploy/env/production.env .env
-fi
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || fail "missing dependency: $1"
+}
 
-echo "==> Verifying environment keys (redacted)"
-grep -E '^(HTTP_|DATABASE_URL|STORAGE_ROOT|LLM_|OPENAI_API_KEY|ANTHROPIC_API_KEY|GOOGLE_API_KEY|GROK_API_KEY|XAI_API_KEY)=' .env | sed -E 's/=(.*)$/=***REDACTED***/'
+require_cmd git
+require_cmd sudo
+require_cmd systemctl
+require_cmd python3
 
-echo "==> Checking decouple can load required keys"
-uv run python - <<'PY'
-from decouple import Config as DecoupleConfig, RepositoryEnv
+[[ -d "$APP_DIR" ]] || fail "APP_DIR does not exist: $APP_DIR"
+[[ -x "$APP_DIR/.venv/bin/python" ]] || fail "missing venv python: $APP_DIR/.venv/bin/python"
+[[ -f "$ENV_FILE" ]] || fail "missing env file: $ENV_FILE"
+
+git -C "$APP_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "APP_DIR is not a git work tree: $APP_DIR"
+git -C "$APP_DIR" diff --quiet || fail "APP_DIR has uncommitted tracked changes"
+git -C "$APP_DIR" diff --cached --quiet || fail "APP_DIR has staged but uncommitted changes"
+
+DB_URL=$(python3 - "$ENV_FILE" <<'PY'
+import sys
 from pathlib import Path
-env = Path('.env')
-cfg = DecoupleConfig(RepositoryEnv(str(env)))
-required = [
-    'HTTP_HOST', 'HTTP_PORT', 'HTTP_PATH',
-    'DATABASE_URL', 'STORAGE_ROOT',
-]
-missing = []
-for name in required:
-    try:
-        _ = cfg(name)
-    except Exception:
-        missing.append(name)
-if missing:
-    raise SystemExit(f"Missing required .env keys: {', '.join(missing)}")
-print("decouple OK:", ', '.join(required))
+
+env_file = Path(sys.argv[1])
+database_url = ""
+for raw in env_file.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    if key.strip() == "DATABASE_URL":
+        database_url = value.strip().strip('"').strip("'")
+        break
+print(database_url)
 PY
+)
 
-echo "==> Running migrations"
-uv run python -m mcp_agent_mail.cli migrate
+[[ -n "$DB_URL" ]] || fail "DATABASE_URL missing from $ENV_FILE"
+case "$DB_URL" in
+  sqlite+aiosqlite:////*|sqlite:////*)
+    ;;
+  *)
+    fail "DATABASE_URL must use an absolute SQLite path for conservative deployment safety: $DB_URL"
+    ;;
+esac
 
-if [ $# -ge 2 ]; then
-  PROJECT_KEY=$1
-  REPO_PATH=$2
-  echo "==> Installing pre-commit guard into $REPO_PATH for project '$PROJECT_KEY'"
-  uv run python -m mcp_agent_mail.cli guard install "$PROJECT_KEY" "$REPO_PATH"
+DB_PATH=$(python3 - "$DB_URL" <<'PY'
+import sys
+from sqlalchemy.engine import make_url
+
+url = make_url(sys.argv[1])
+print(url.database or "")
+PY
+)
+
+[[ -n "$DB_PATH" ]] || fail "could not resolve DATABASE_URL path"
+[[ -f "$DB_PATH" ]] || fail "database file does not exist: $DB_PATH"
+[[ -s "$DB_PATH" ]] || fail "database file is empty: $DB_PATH"
+
+CURRENT_REV=$(git -C "$APP_DIR" rev-parse --short=12 HEAD)
+
+TMP_UNIT=$(mktemp)
+cleanup() {
+  rm -f "$TMP_UNIT"
+}
+trap cleanup EXIT
+
+cat >"$TMP_UNIT" <<EOF
+[Unit]
+Description=MCP Agent Mail HTTP Service
+After=network.target
+
+[Service]
+Type=simple
+User=$RUN_USER
+Group=$RUN_GROUP
+WorkingDirectory=$APP_DIR
+EnvironmentFile=$ENV_FILE
+Environment=MCP_AGENT_MAIL_ENV_FILE=$ENV_FILE
+ExecStartPre=/usr/bin/test -f $ENV_FILE
+ExecStartPre=/usr/bin/test -f $DB_PATH
+ExecStartPre=/usr/bin/test -x $APP_DIR/.venv/bin/python
+ExecStart=$APP_DIR/.venv/bin/python -m mcp_agent_mail.http --host $HOST --port $PORT
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "==> release commit: $CURRENT_REV"
+echo "==> app dir: $APP_DIR"
+echo "==> env file: $ENV_FILE"
+echo "==> database: $DB_PATH"
+echo "==> backing up existing unit to $UNIT_BACKUP"
+if sudo test -f "$UNIT_PATH"; then
+  sudo cp "$UNIT_PATH" "$UNIT_BACKUP"
 fi
 
-echo
-echo "Next steps:"
-echo "  - Run server: uv run python -m mcp_agent_mail.cli serve-http"
-echo "  - Verify health: curl -sS http://$HTTP_HOST:$HTTP_PORT/health/readiness | jq ."
-echo "==> Deploy bootstrap complete"
+echo "==> installing unit"
+sudo cp "$TMP_UNIT" "$UNIT_PATH"
+sudo systemctl daemon-reload
+
+rollback() {
+  echo "==> smoke check failed; restoring previous unit" >&2
+  if sudo test -f "$UNIT_BACKUP"; then
+    sudo cp "$UNIT_BACKUP" "$UNIT_PATH"
+    sudo systemctl daemon-reload
+    sudo systemctl restart "$SERVICE_NAME"
+  fi
+}
+
+echo "==> restarting $SERVICE_NAME"
+sudo systemctl restart "$SERVICE_NAME"
+
+echo "==> running smoke checks"
+if ! APP_DIR="$APP_DIR" ENV_FILE="$ENV_FILE" HOST="$HOST" PORT="$PORT" MCP_PATH="$MCP_PATH" \
+  SMOKE_PROJECT_KEY="$SMOKE_PROJECT_KEY" SMOKE_AGENT_NAME="$SMOKE_AGENT_NAME" \
+  "$ROOT_DIR/scripts/smoke_check.sh"; then
+  rollback
+  fail "deployment smoke check failed"
+fi
+
+echo "==> deployment complete"
+echo "    unit: $UNIT_PATH"
+echo "    backup: $UNIT_BACKUP"

@@ -44,7 +44,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.sql import ColumnElement
 
 from .app import _sanitize_fts_query, build_mcp_server
-from .config import get_settings
+from .config import get_settings, resolve_env_file_path
 from .db import ensure_schema, get_session, reset_database_state
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
 from .http import build_http_app
@@ -79,7 +79,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="bleach")
 atexit.register(reset_database_state)
 
 console = Console()
-DEFAULT_ENV_PATH = Path(".env")
+DEFAULT_ENV_PATH = resolve_env_file_path()
 ARCHIVE_DIR_NAME = "archived_mailbox_states"
 ARCHIVE_METADATA_FILENAME = "metadata.json"
 ARCHIVE_SNAPSHOT_RELATIVE = Path("snapshot") / "mailbox.sqlite3"
@@ -4281,9 +4281,9 @@ def list_acks(
 @config_app.command("set-port")
 def config_set_port(
     port: int = typer.Argument(..., help="HTTP server port number"),
-    env_file: Annotated[Optional[Path], typer.Option("--env-file", help="Path to .env file")] = None,
+    env_file: Annotated[Optional[Path], typer.Option("--env-file", help="Path to env file")] = None,
 ) -> None:
-    """Set HTTP_PORT in .env file."""
+    """Set HTTP_PORT in the configured env file."""
     import re
 
     if port < 1 or port > 65535:
