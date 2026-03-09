@@ -469,7 +469,7 @@ class SecurityAndRateLimitMiddleware:
                 self._last_cleanup = now
 
         # Allow CORS preflight and health endpoints
-        if request.method == "OPTIONS" or request.url.path.startswith("/health/"):
+        if request.method == "OPTIONS" or request.url.path.startswith("/health/") or request.url.path == "/api/health":
             await self.app(scope, receive, send)
             return
 
@@ -1189,6 +1189,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 structlog.get_logger("health").error("readiness_error", error=str(exc))
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
         return JSONResponse({"status": "ready"})
+
+    @fastapi_app.get("/api/health")
+    async def api_health_bypass() -> JSONResponse:
+        """Lightweight health probe that bypasses the MCP transport layer.
+
+        Returns immediately without touching the database or connection pool,
+        so it stays responsive even when the MCP ASGI pipeline is saturated
+        under heavy multi-agent load.
+        """
+        return JSONResponse({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
 
     def _oauth_metadata_disabled_response() -> JSONResponse:
         return JSONResponse({"mcp_oauth": False}, status_code=404)
