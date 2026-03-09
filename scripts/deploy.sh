@@ -38,7 +38,12 @@ git -C "$APP_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "APP_D
 git -C "$APP_DIR" diff --quiet || fail "APP_DIR has uncommitted tracked changes"
 git -C "$APP_DIR" diff --cached --quiet || fail "APP_DIR has staged but uncommitted changes"
 
-DB_URL=$(python3 - "$ENV_FILE" <<'PY'
+read_env_file_cmd=(python3 -)
+if [[ ! -r "$ENV_FILE" ]]; then
+  read_env_file_cmd=(sudo python3 -)
+fi
+
+DB_URL=$("${read_env_file_cmd[@]}" "$ENV_FILE" <<'PY'
 import sys
 from pathlib import Path
 
