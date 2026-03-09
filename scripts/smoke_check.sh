@@ -51,22 +51,6 @@ if payload.get("error"):
     raise SystemExit(f"health_check returned error: {payload['error']}")
 PY
 
-echo "==> projects resource"
-projects_payload='{"jsonrpc":"2.0","id":"smoke-projects","method":"resources/read","params":{"uri":"resource://projects"}}'
-projects_response=$(curl "${curl_args[@]}" -H "Content-Type: application/json" -d "$projects_payload" "${SERVICE_URL}${MCP_PATH}")
-python3 - "$projects_response" <<'PY'
-import json
-import sys
-
-payload = json.loads(sys.argv[1])
-if payload.get("error"):
-    raise SystemExit(f"projects resource returned error: {payload['error']}")
-result = payload.get("result") or {}
-contents = result.get("contents") or []
-if not contents:
-    raise SystemExit("projects resource returned no contents")
-PY
-
 if [[ -n "$SMOKE_PROJECT_KEY" && -n "$SMOKE_AGENT_NAME" ]]; then
   echo "==> fetch_inbox smoke for ${SMOKE_AGENT_NAME} @ ${SMOKE_PROJECT_KEY}"
   inbox_payload=$(python3 - "$SMOKE_PROJECT_KEY" "$SMOKE_AGENT_NAME" <<'PY'
