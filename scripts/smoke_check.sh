@@ -25,7 +25,19 @@ if [[ -n "$AUTH_HEADER" ]]; then
 fi
 
 echo "==> liveness"
-curl "${curl_args[@]}" "${SERVICE_URL}/health/liveness" >/dev/null
+ready=0
+for _ in $(seq 1 30); do
+  if curl "${curl_args[@]}" "${SERVICE_URL}/health/liveness" >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+
+if [[ "$ready" != "1" ]]; then
+  echo "service did not become healthy within 30s" >&2
+  exit 1
+fi
 
 echo "==> health_check tool"
 health_payload='{"jsonrpc":"2.0","id":"smoke-health","method":"tools/call","params":{"name":"health_check","arguments":{}}}'
