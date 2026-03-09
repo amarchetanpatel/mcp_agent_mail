@@ -220,7 +220,7 @@ def _bridge_provider_env() -> None:
     # Gracefully handle missing env file (e.g., in CI/tests)
     try:
         cfg = DecoupleConfig(RepositoryEnv(str(resolve_env_file_path())))
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError):
         cfg = DecoupleConfig(RepositoryEmpty())
 
     def _get_from_any(*keys: str) -> str:

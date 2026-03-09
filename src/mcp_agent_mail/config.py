@@ -28,7 +28,7 @@ def _load_decouple_config() -> DecoupleConfig:
     # Gracefully handle missing env file (e.g., in CI/tests) by falling back to an empty repository.
     try:
         return DecoupleConfig(RepositoryEnv(str(resolve_env_file_path())))
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError):
         # Fall back to an empty repository (reads only os.environ; all env lookups use defaults)
         return DecoupleConfig(RepositoryEmpty())
 
