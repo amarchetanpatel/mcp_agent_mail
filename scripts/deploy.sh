@@ -38,9 +38,11 @@ git -C "$APP_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "APP_D
 git -C "$APP_DIR" diff --quiet || fail "APP_DIR has uncommitted tracked changes"
 git -C "$APP_DIR" diff --cached --quiet || fail "APP_DIR has staged but uncommitted changes"
 
-read_env_file_cmd=(python3 -)
+APP_PYTHON="$APP_DIR/.venv/bin/python"
+
+read_env_file_cmd=("$APP_PYTHON" -)
 if [[ ! -r "$ENV_FILE" ]]; then
-  read_env_file_cmd=(sudo python3 -)
+  read_env_file_cmd=(sudo "$APP_PYTHON" -)
 fi
 
 DB_URL=$("${read_env_file_cmd[@]}" "$ENV_FILE" <<'PY'
@@ -70,7 +72,7 @@ case "$DB_URL" in
     ;;
 esac
 
-DB_PATH=$(python3 - "$DB_URL" <<'PY'
+DB_PATH=$("$APP_PYTHON" - "$DB_URL" <<'PY'
 import sys
 from sqlalchemy.engine import make_url
 
