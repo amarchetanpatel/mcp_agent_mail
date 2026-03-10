@@ -12,7 +12,6 @@ import json
 import logging
 import re
 import subprocess
-from collections.abc import MutableMapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -28,7 +27,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.engine import make_url
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.types import Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .app import (
     _expire_stale_file_reservations,
@@ -268,54 +267,24 @@ def _configure_logging(settings: Settings) -> None:
     _LOGGING_CONFIGURED = True
 
 
-class BearerAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: FastAPI, token: str, allow_localhost: bool = False) -> None:
-        super().__init__(app)
-        self._token = token
-        self._allow_localhost = allow_localhost
-
+class BearerAuthMiddleware:
     @staticmethod
     def _is_localhost(host: str) -> bool:
         """Check if host is a localhost address, including IPv4-mapped IPv6."""
         if not host:
             return False
-        # Standard localhost addresses
         if host in {"127.0.0.1", "::1", "localhost"}:
             return True
-        # IPv4-mapped IPv6 address (::ffff:127.0.0.1)
         return bool(host.lower().startswith("::ffff:") and host[7:] == "127.0.0.1")
 
     @staticmethod
     def _has_forwarded_headers(request: Request) -> bool:
         """Detect proxy-forwarded headers to avoid trusting localhost behind proxies."""
         headers = request.headers
-        return any(
-            name in headers
-            for name in ("x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "forwarded")
-        )
-
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
-        if request.method == "OPTIONS":  # allow CORS preflight
-            return await call_next(request)
-        if request.url.path.startswith("/health/"):
-            return await call_next(request)
-        # Allow localhost without Authorization when enabled
-        try:
-            client_host = request.client.host if request.client else ""
-        except Exception:
-            client_host = ""
-        # Check for localhost bypass (including IPv4-mapped IPv6 addresses)
-        if self._allow_localhost and self._is_localhost(client_host) and not self._has_forwarded_headers(request):
-            return await call_next(request)
-        auth_header = request.headers.get("Authorization", "")
-        expected_header = f"Bearer {self._token}"
-        # Use constant-time comparison to prevent timing attacks
-        if not hmac.compare_digest(auth_header, expected_header):
-            return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
-        return await call_next(request)
+        return any(name in headers for name in ("x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "forwarded"))
 
 
-class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
+class SecurityAndRateLimitMiddleware:
     """JWT auth (optional), RBAC, and token-bucket rate limiting.
 
     - If JWT is enabled, validates Authorization: Bearer <token> using either HMAC secret or JWKS URL.
@@ -323,9 +292,10 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
     - Applies per-endpoint token-bucket limits (tools vs resources) with in-memory or Redis backend.
     """
 
-    def __init__(self, app: FastAPI, settings: Settings):
-        super().__init__(app)
+    def __init__(self, app: ASGIApp, settings: Settings):
+        self.app = app
         self.settings = settings
+        self._bearer_token = getattr(settings.http, "bearer_token", None) or None
         self._jwt_enabled = bool(getattr(settings.http, "jwt_enabled", False))
         self._rbac_enabled = bool(getattr(settings.http, "rbac_enabled", True))
         self._reader_roles = set(getattr(settings.http, "rbac_reader_roles", []) or [])
@@ -482,7 +452,12 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
         self._buckets[key] = (tokens, now)
         return True
 
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive=receive)
         # Perform periodic cleanup of in-memory rate limit buckets
         if self._redis is None:
             now = self._monotonic()
@@ -492,23 +467,46 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
 
         # Allow CORS preflight and health endpoints
         if request.method == "OPTIONS" or request.url.path.startswith("/health/"):
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
+
+        # Bearer token auth for deployments that rely on a shared HTTP secret.
+        # Keep this inside the main security middleware to avoid layering another
+        # middleware wrapper around the in-process MCP transport.
+        if self._bearer_token:
+            try:
+                client_host = request.client.host if request.client else ""
+            except Exception:
+                client_host = ""
+            localhost_allowed = (
+                bool(getattr(self.settings.http, "allow_localhost_unauthenticated", False))
+                and BearerAuthMiddleware._is_localhost(client_host)
+                and not BearerAuthMiddleware._has_forwarded_headers(request)
+            )
+            if not localhost_allowed:
+                auth_header = request.headers.get("Authorization", "")
+                expected_header = f"Bearer {self._bearer_token}"
+                if not hmac.compare_digest(auth_header, expected_header):
+                    response = JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+                    await response(scope, receive, send)
+                    return
 
         # Only read/patch body for POST requests. GET (including SSE) must not receive http.request messages.
         body_bytes = b""
+        downstream_receive = receive
         if request.method.upper() == "POST":
             try:
                 body_bytes = await request.body()
                 body_sent = False
 
-                async def _receive() -> dict:
+                async def _receive() -> dict[str, Any]:
                     nonlocal body_sent
                     if body_sent:
                         return {"type": "http.request", "body": b"", "more_body": False}
                     body_sent = True
                     return {"type": "http.request", "body": body_bytes, "more_body": False}
 
-                cast(Any, request)._receive = _receive
+                downstream_receive = _receive
             except Exception:
                 body_bytes = b""
 
@@ -518,12 +516,18 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
         if self._jwt_enabled:
             auth_header = request.headers.get("Authorization", "")
             if not auth_header.startswith("Bearer "):
-                return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+                response = JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+                await response(scope, receive, send)
+                return
             token = auth_header.split(" ", 1)[1].strip()
             claims_dict = await self._decode_jwt(token)
             if claims_dict is None:
-                return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+                response = JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+                await response(scope, receive, send)
+                return
             claims = cast(dict[str, Any], claims_dict)
+            scope.setdefault("state", {})
+            cast(dict[str, Any], scope["state"])["jwt_claims"] = claims
             request.state.jwt_claims = claims
             roles_raw = claims.get(self.settings.http.jwt_role_claim, [])
             if isinstance(roles_raw, str):
@@ -567,14 +571,20 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
                 if not tool_name:
                     # Without name, assume write-required to be safe
                     if not is_writer:
-                        return JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+                        response = JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+                        await response(scope, receive, send)
+                        return
                 else:
                     if tool_name in self._readonly_tools:
                         if not is_reader and not is_writer:
-                            return JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+                            response = JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+                            await response(scope, receive, send)
+                            return
                     else:
                         if not is_writer:
-                            return JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+                            response = JSONResponse({"detail": "Forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+                            await response(scope, receive, send)
+                            return
 
         # Rate limiting
         if self.settings.http.rate_limit_enabled:
@@ -591,9 +601,11 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
             key = f"{kind}:{endpoint}:{identity}"
             allowed = await self._consume_bucket(key, rpm, burst)
             if not allowed:
-                return JSONResponse({"detail": "Rate limit exceeded"}, status_code=status.HTTP_429_TOO_MANY_REQUESTS)
+                response = JSONResponse({"detail": "Rate limit exceeded"}, status_code=status.HTTP_429_TOO_MANY_REQUESTS)
+                await response(scope, receive, send)
+                return
 
-        return await call_next(request)
+        await self.app(scope, downstream_receive, send)
 
 
 async def readiness_check() -> None:
@@ -1111,16 +1123,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     ):
         app_any = cast(Any, fastapi_app)
         app_any.add_middleware(SecurityAndRateLimitMiddleware, settings=settings)
-    # Bearer auth for non-localhost only; allow localhost unauth optionally for seamless local dev
-    if settings.http.bearer_token:
-        from typing import Any as _Any, cast as _cast  # local type-only import
-        app_any = _cast(_Any, fastapi_app)
-        app_any.add_middleware(
-            BearerAuthMiddleware,
-            token=settings.http.bearer_token,
-            allow_localhost=bool(getattr(settings.http, "allow_localhost_unauthenticated", False)),
-        )
-
     # Optional CORS
     if settings.cors.enabled:
         from typing import Any as _Any, cast as _cast  # local type-only import
@@ -1230,8 +1232,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         mount_base = "/" + mount_base
     base_no_slash = mount_base.rstrip("/") or "/"
     base_with_slash = base_no_slash if base_no_slash == "/" else base_no_slash + "/"
-    stateless_app = StatelessMCPASGIApp(server)
-
     mount_paths = [base_no_slash, base_with_slash]
     for compat_base in ("/api", "/mcp"):
         compat_no_slash = compat_base.rstrip("/") or "/"
@@ -1261,54 +1261,133 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     for path in sorted(oauth_metadata_paths):
         _register_oauth_metadata_disabled(path)
 
-    for mount_path in mount_paths:
-        with contextlib.suppress(Exception):
-            fastapi_app.mount(mount_path, stateless_app)
+    class _InProcessHTTPSession:
+        async def send_log_message(self, *args: Any, **kwargs: Any) -> None:
+            return None
 
-    # Expose composed lifespan via router
-    fastapi_app.router.lifespan_context = lifespan_context
+        async def send_progress_notification(self, *args: Any, **kwargs: Any) -> None:
+            return None
 
-    # Add direct routes at no-slash base paths to tolerate clients omitting trailing slashes.
-    def _register_base_passthrough(base_path_no_slash: str, base_path_with_slash: str) -> None:
-        @fastapi_app.post(base_path_no_slash)
-        async def _base_passthrough(request: Request) -> JSONResponse:
-            # Re-dispatch to mounted stateless app by calling it directly
-            response_body: dict[str, Any] = {}
-            status_code = 200
-            headers: dict[str, str] = {}
+        async def list_roots(self, *args: Any, **kwargs: Any) -> list[Any]:
+            return []
 
-            async def _send(message: MutableMapping[str, Any]) -> None:
-                nonlocal response_body, status_code, headers
-                if message.get("type") == "http.response.start":
-                    status_code = int(message.get("status", 200))
-                    hdrs = message.get("headers") or []
-                    for k, v in hdrs:
-                        headers[k.decode("latin1")] = v.decode("latin1")
-                elif message.get("type") == "http.response.body":
-                    body = message.get("body") or b""
-                    try:
-                        response_body = json.loads(body.decode("utf-8")) if body else {}
-                    except Exception:
-                        response_body = {}
+        async def send_tool_list_changed(self, *args: Any, **kwargs: Any) -> None:
+            return None
 
-            # If localhost and allow_localhost_unauthenticated, synthesize Authorization header automatically
-            scope = dict(request.scope)
-            try:
-                client_host = request.client.host if request.client else ""
-            except Exception:
-                client_host = ""
-            if settings.http.allow_localhost_unauthenticated and client_host in {"127.0.0.1", "::1", "localhost"}:
-                scope_headers = list(scope.get("headers") or [])
-                has_auth = any(k.lower() == b"authorization" for k, _ in scope_headers)
-                if not has_auth and settings.http.bearer_token:
-                    scope_headers.append((b"authorization", f"Bearer {settings.http.bearer_token}".encode("latin1")))
-                scope["headers"] = scope_headers
-            await stateless_app(
-                {**scope, "path": base_path_with_slash},  # ensure mounted path
-                request.receive,
-                _send,
+        async def send_resource_list_changed(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        async def send_prompt_list_changed(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def check_client_capability(self, *args: Any, **kwargs: Any) -> bool:
+            return True
+
+        async def create_message(self, *args: Any, **kwargs: Any) -> Any:
+            return None
+
+        async def elicit(self, *args: Any, **kwargs: Any) -> Any:
+            return None
+
+    def _json_ready(value: Any) -> Any:
+        if hasattr(value, "model_dump"):
+            return value.model_dump(mode="json", exclude_none=True)
+        if isinstance(value, list):
+            return [_json_ready(item) for item in value]
+        if isinstance(value, tuple):
+            return [_json_ready(item) for item in value]
+        if isinstance(value, dict):
+            return {str(k): _json_ready(v) for k, v in value.items()}
+        return value
+
+    async def _dispatch_inprocess_jsonrpc(request: Request, payload: dict[str, Any]) -> JSONResponse:
+        from mcp.server.lowlevel.server import request_ctx as _request_ctx
+        from mcp.shared.context import RequestContext as _RequestContext
+
+        request_id = payload.get("id")
+        method = payload.get("method")
+        params = payload.get("params")
+        if not isinstance(method, str):
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32600, "message": "Invalid Request"}},
+                status_code=200,
             )
-            return JSONResponse(response_body, status_code=status_code, headers=headers)
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "Invalid params"}},
+                status_code=200,
+            )
+
+        ctx = _RequestContext(
+            request_id=request_id if request_id is not None else "1",
+            meta=None,
+            session=_InProcessHTTPSession(),
+            lifespan_context={},
+            request=request,
+        )
+        token = _request_ctx.set(ctx)
+        try:
+            if method == "tools/call":
+                tool_name = params.get("name")
+                arguments = params.get("arguments", {})
+                if not isinstance(tool_name, str) or not isinstance(arguments, dict):
+                    raise ValueError("tools/call requires string name and object arguments")
+                tool_result = await server._call_tool_mcp(tool_name, arguments)  # type: ignore[attr-defined]
+                if isinstance(tool_result, tuple):
+                    content, structured = tool_result
+                    result = {
+                        "content": _json_ready(content),
+                        "structuredContent": _json_ready(structured),
+                        "isError": False,
+                    }
+                else:
+                    result = {"content": _json_ready(tool_result), "isError": False}
+            elif method == "resources/list":
+                result = {"resources": _json_ready(await server._list_resources_mcp())}  # type: ignore[attr-defined]
+            elif method == "resources/read":
+                uri = params.get("uri")
+                if not isinstance(uri, str):
+                    raise ValueError("resources/read requires string uri")
+                result = {"contents": _json_ready(await server._read_resource_mcp(uri))}  # type: ignore[attr-defined]
+            elif method == "resources/templates/list":
+                result = {
+                    "resourceTemplates": _json_ready(await server._list_resource_templates_mcp())  # type: ignore[attr-defined]
+                }
+            elif method == "tools/list":
+                result = {"tools": _json_ready(await server._list_tools_mcp())}  # type: ignore[attr-defined]
+            elif method == "ping":
+                result = {}
+            else:
+                return JSONResponse(
+                    {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found"}},
+                    status_code=200,
+                )
+            return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": result}, status_code=200)
+        except Exception as exc:
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": str(exc)}},
+                status_code=200,
+            )
+        finally:
+            _request_ctx.reset(token)
+
+    # Add direct routes at the base paths before broad mounts so exact POST requests
+    # from in-process ASGI tests do not get swallowed by the mount entries first.
+    def _register_base_passthrough(base_path_no_slash: str, base_path_with_slash: str) -> None:
+        async def _base_passthrough_impl(request: Request) -> JSONResponse:
+            try:
+                payload = await request.json()
+            except Exception:
+                return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+            if not isinstance(payload, dict):
+                return JSONResponse({"detail": "Invalid JSON-RPC payload"}, status_code=400)
+            return await _dispatch_inprocess_jsonrpc(request, payload)
+
+        fastapi_app.add_api_route(base_path_no_slash, _base_passthrough_impl, methods=["POST"], include_in_schema=False)
+        if base_path_with_slash != base_path_no_slash:
+            fastapi_app.add_api_route(base_path_with_slash, _base_passthrough_impl, methods=["POST"], include_in_schema=False)
 
     passthrough_pairs: list[tuple[str, str]] = [(base_no_slash, base_with_slash)]
     for compat_base in ("/api", "/mcp"):
@@ -1318,6 +1397,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             passthrough_pairs.append((compat_no_slash, compat_with_slash))
     for no_slash, with_slash in passthrough_pairs:
         _register_base_passthrough(no_slash, with_slash)
+
+    for mount_path in mount_paths:
+        with contextlib.suppress(Exception):
+            fastapi_app.mount(mount_path, mcp_http_app)
+
+    # Expose composed lifespan via router
+    fastapi_app.router.lifespan_context = lifespan_context
 
     # ----- Simple SSR Mail UI -----
     def _register_mail_ui() -> None:
