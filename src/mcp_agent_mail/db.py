@@ -813,6 +813,70 @@ def _setup_fts(connection: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages (project_id, topic)",
     ]:
         connection.exec_driver_sql(index_sql)
+    _migrate_agents_to_project_scoped_names(connection)
+
+
+def _migrate_agents_to_project_scoped_names(connection: Any) -> None:
+    """Rebuild SQLite agents table if it still enforces global name uniqueness."""
+    if getattr(getattr(connection, "dialect", None), "name", None) != "sqlite":
+        return
+
+    row = connection.exec_driver_sql(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agents'"
+    ).fetchone()
+    create_sql = str(row[0] or "") if row else ""
+    lowered = create_sql.lower()
+    if not create_sql:
+        return
+    if "uq_agent_name_global" not in lowered and "unique (name)" not in lowered and "unique(name)" not in lowered:
+        return
+
+    connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+    try:
+        connection.exec_driver_sql("ALTER TABLE agents RENAME TO agents_old_global_names")
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name VARCHAR(128) NOT NULL,
+                program VARCHAR(128) NOT NULL,
+                model VARCHAR(128) NOT NULL,
+                task_description VARCHAR(2048) NOT NULL DEFAULT '',
+                inception_ts DATETIME NOT NULL,
+                last_active_ts DATETIME NOT NULL,
+                attachments_policy VARCHAR(16) NOT NULL DEFAULT 'auto',
+                contact_policy VARCHAR(16) NOT NULL DEFAULT 'auto',
+                registration_token VARCHAR(64) DEFAULT NULL,
+                retired_at DATETIME DEFAULT NULL,
+                CONSTRAINT uq_agent_project_name UNIQUE (project_id, name),
+                FOREIGN KEY(project_id) REFERENCES projects (id)
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            """
+            INSERT INTO agents (
+                id, project_id, name, program, model, task_description,
+                inception_ts, last_active_ts, attachments_policy, contact_policy,
+                registration_token, retired_at
+            )
+            SELECT
+                id, project_id, name, program, model,
+                COALESCE(task_description, ''),
+                inception_ts, last_active_ts,
+                COALESCE(attachments_policy, 'auto'),
+                COALESCE(contact_policy, 'auto'),
+                registration_token, retired_at
+            FROM agents_old_global_names
+            """
+        )
+        connection.exec_driver_sql("DROP TABLE agents_old_global_names")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_agents_project_id ON agents (project_id)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_agents_name ON agents (name)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_agents_registration_token ON agents (registration_token)")
+    finally:
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
 
 
 def get_database_path(settings: Settings | None = None) -> Path | None:

@@ -2833,16 +2833,12 @@ async def update_project_sibling_status(project_id: int, other_id: int, status: 
 
 
 async def _agent_name_exists(name: str, project: Project | None = None) -> bool:
-    """Check if agent name exists globally (or within project if specified).
-
-    With global uniqueness ("Meta Stability Town"), agent names are unique across
-    all projects. The optional project parameter is kept for backward compatibility
-    but is ignored when checking existence.
-    """
+    """Check if an agent name exists globally or within a specific project."""
     async with get_session() as session:
-        result = await session.execute(
-            select(Agent.id).where(func.lower(Agent.name) == name.lower())
-        )
+        stmt = select(Agent.id).where(func.lower(Agent.name) == name.lower())
+        if project is not None and project.id is not None:
+            stmt = stmt.where(Agent.project_id == project.id)
+        result = await session.execute(stmt)
         return result.first() is not None
 
 async def _get_window_identity(
@@ -2946,7 +2942,7 @@ async def _generate_unique_agent_name(
     archive = await ensure_archive(settings, project.slug)
 
     async def available(candidate: str) -> bool:
-        return not await _agent_name_exists(candidate) and not (archive.root / "agents" / candidate).exists()
+        return not await _agent_name_exists(candidate, project) and not (archive.root / "agents" / candidate).exists()
 
     mode = getattr(settings, "agent_name_enforcement_mode", "coerce").lower()
     if name_hint:
@@ -3085,43 +3081,14 @@ async def _get_or_create_agent(
         desired_name = await _generate_unique_agent_name(project, settings, None)
     await ensure_schema()
 
-    # Global uniqueness check: if explicit name provided, check if it exists in another project
-    if explicit_name_used:
-        existing_agent = await _get_agent_by_name_global(desired_name)
-        if existing_agent and existing_agent.project_id != project.id:
-            raise ToolExecutionError(
-                "AGENT_NAME_TAKEN",
-                f"Agent name '{desired_name}' is already registered in another project. "
-                f"Agent names are globally unique across all projects ('Meta Stability Town'). "
-                f"Choose a different name or omit 'name' to auto-generate one.",
-                recoverable=True,
-                data={
-                    "provided_name": desired_name,
-                    "valid_examples": ["BlueLake", "GreenCastle", "RedStone"],
-                },
-            )
-
     async with get_session() as session:
         for _attempt in range(5):
-            # Check globally for the agent (names are now globally unique)
+            # Names are unique within a project; cross-project duplicates are allowed.
             result = await session.execute(
-                select(Agent).where(func.lower(Agent.name) == desired_name.lower())
+                select(Agent).where(Agent.project_id == project.id, func.lower(Agent.name) == desired_name.lower())
             )
             agent = result.scalars().first()
             if agent:
-                # Agent exists - only allow update if it's in the same project
-                if agent.project_id != project.id:
-                    raise ToolExecutionError(
-                        "AGENT_NAME_TAKEN",
-                        f"Agent name '{desired_name}' is already registered in another project. "
-                        f"Agent names are globally unique across all projects ('Meta Stability Town'). "
-                        f"Choose a different name or omit 'name' to auto-generate one.",
-                        recoverable=True,
-                        data={
-                            "provided_name": desired_name,
-                            "valid_examples": ["BlueLake", "GreenCastle", "RedStone"],
-                        },
-                    )
                 # Same project - update metadata (idempotent behavior)
                 agent.program = program
                 agent.model = model
@@ -3151,25 +3118,13 @@ async def _get_or_create_agent(
                     session.expunge(candidate)
 
                 if explicit_name_used:
-                    # Another concurrent call created this identity globally; check if it's ours
+                    # Another concurrent call created this identity in the same project.
                     result = await session.execute(
-                        select(Agent).where(func.lower(Agent.name) == desired_name.lower())
+                        select(Agent).where(Agent.project_id == project.id, func.lower(Agent.name) == desired_name.lower())
                     )
                     agent = result.scalars().first()
                     if agent is None:
                         raise
-                    if agent.project_id != project.id:
-                        raise ToolExecutionError(
-                            "AGENT_NAME_TAKEN",
-                            f"Agent name '{desired_name}' is already registered in another project. "
-                            f"Agent names are globally unique across all projects ('Meta Stability Town'). "
-                            f"Choose a different name or omit 'name' to auto-generate one.",
-                            recoverable=True,
-                            data={
-                                "provided_name": desired_name,
-                                "valid_examples": ["BlueLake", "GreenCastle", "RedStone"],
-                            },
-                        )
                     # Same project - treat as idempotent update
                     agent.program = program
                     agent.model = model
@@ -6254,7 +6209,12 @@ def build_mcp_server() -> FastMCP:
                             "Recipient is not accepting messages.",
                             recoverable=True,
                         )
-                    # contacts_only or auto -> must have approved link or prior contact within TTL
+                    # Local same-project delivery remains permissive by default. Contacts are
+                    # primarily for cross-project routing and explicit hard blocks; only
+                    # block_all should prevent ordinary same-project messaging.
+                    if rec_policy in {"auto", "contacts_only"}:
+                        continue
+                    # Future/unknown policies fall back to the stricter heuristics below.
                     recent_ok = rec.name in recent_ok_names
                     if rec_policy == "auto" and recent_ok:
                         continue
@@ -10755,8 +10715,7 @@ def build_mcp_server() -> FastMCP:
                 resource_name="resource://identity/{project}",
                 format_value=format_value,
             )
-    @mcp.resource("resource://tooling/directory{?format}", mime_type="application/json")
-    def tooling_directory_resource(format: Optional[str] = None) -> dict[str, Any]:
+    def _tooling_directory_payload(format: Optional[str] = None) -> dict[str, Any]:
         """
         Provide a clustered view of exposed MCP tools to combat option overload.
 
@@ -11093,8 +11052,15 @@ def build_mcp_server() -> FastMCP:
             format_value=format,
         )
 
-    @mcp.resource("resource://tooling/schemas{?format}", mime_type="application/json")
-    def tooling_schemas_resource(format: Optional[str] = None) -> dict[str, Any]:
+    @mcp.resource("resource://tooling/directory", mime_type="application/json")
+    def tooling_directory_resource_exact() -> dict[str, Any]:
+        return _tooling_directory_payload()
+
+    @mcp.resource("resource://tooling/directory{?format}", mime_type="application/json")
+    def tooling_directory_resource(format: Optional[str] = None) -> dict[str, Any]:
+        return _tooling_directory_payload(format)
+
+    def _tooling_schemas_payload(format: Optional[str] = None) -> dict[str, Any]:
         """Expose JSON-like parameter schemas for tools/macros to prevent drift.
 
         This is a lightweight, hand-maintained view focusing on the most error-prone
@@ -11140,8 +11106,15 @@ def build_mcp_server() -> FastMCP:
             format_value=format,
         )
 
-    @mcp.resource("resource://tooling/metrics{?format}", mime_type="application/json")
-    def tooling_metrics_resource(format: Optional[str] = None) -> dict[str, Any]:
+    @mcp.resource("resource://tooling/schemas", mime_type="application/json")
+    def tooling_schemas_resource_exact() -> dict[str, Any]:
+        return _tooling_schemas_payload()
+
+    @mcp.resource("resource://tooling/schemas{?format}", mime_type="application/json")
+    def tooling_schemas_resource(format: Optional[str] = None) -> dict[str, Any]:
+        return _tooling_schemas_payload(format)
+
+    def _tooling_metrics_payload(format: Optional[str] = None) -> dict[str, Any]:
         """Expose aggregated tool call/error counts for analysis."""
         payload = {
             "generated_at": _iso(datetime.now(timezone.utc)),
@@ -11154,8 +11127,15 @@ def build_mcp_server() -> FastMCP:
             format_value=format,
         )
 
-    @mcp.resource("resource://tooling/locks{?format}", mime_type="application/json")
-    def tooling_locks_resource(format: Optional[str] = None) -> dict[str, Any]:
+    @mcp.resource("resource://tooling/metrics", mime_type="application/json")
+    def tooling_metrics_resource_exact() -> dict[str, Any]:
+        return _tooling_metrics_payload()
+
+    @mcp.resource("resource://tooling/metrics{?format}", mime_type="application/json")
+    def tooling_metrics_resource(format: Optional[str] = None) -> dict[str, Any]:
+        return _tooling_metrics_payload(format)
+
+    def _tooling_locks_payload(format: Optional[str] = None) -> dict[str, Any]:
         """Return lock metadata from the shared archive storage."""
 
         settings_local = get_settings()
@@ -11166,6 +11146,14 @@ def build_mcp_server() -> FastMCP:
             resource_name="resource://tooling/locks",
             format_value=format,
         )
+
+    @mcp.resource("resource://tooling/locks", mime_type="application/json")
+    def tooling_locks_resource_exact() -> dict[str, Any]:
+        return _tooling_locks_payload()
+
+    @mcp.resource("resource://tooling/locks{?format}", mime_type="application/json")
+    def tooling_locks_resource(format: Optional[str] = None) -> dict[str, Any]:
+        return _tooling_locks_payload(format)
 
     @mcp.resource("resource://tooling/capabilities/{agent}{?project,format}", mime_type="application/json")
     def tooling_capabilities_resource(
@@ -12493,21 +12481,8 @@ def build_mcp_server() -> FastMCP:
                 pass
 
         if project is None:
-            # Auto-detect project by agent name if uniquely identifiable
-            async with get_session() as s_auto:
-                rows = await s_auto.execute(
-                    select(Project)
-                    .join(Agent, cast(Any, Agent.project_id) == Project.id)
-                    .where(func.lower(Agent.name) == agent.lower())
-                    .limit(2)
-                )
-                projects = [row[0] for row in rows.all()]
-            if len(projects) == 1:
-                project_obj = projects[0]
-            else:
-                raise ValueError("project parameter is required for outbox resource")
-        else:
-            project_obj = await _get_project_by_identifier(project)
+            raise ValueError("project parameter is required for outbox resource")
+        project_obj = await _get_project_by_identifier(project)
         agent_obj = await _get_agent(project_obj, agent)
         items = await _list_outbox(project_obj, agent_obj, limit, include_bodies, since_ts)
         enriched: list[dict[str, Any]] = []
@@ -12535,6 +12510,18 @@ def build_mcp_server() -> FastMCP:
     # -------------------------------------------------------------------------------------------------
     if settings.tool_filter.enabled:
         _apply_tool_filter(mcp, settings)
+
+    # FastMCP renamed several direct-call helpers; keep the older attribute
+    # names for existing tests and internal callers.
+    compat_aliases = {
+        "_mcp_call_tool": "_call_tool_mcp",
+        "_mcp_read_resource": "_read_resource_mcp",
+        "_mcp_list_resources": "_list_resources_mcp",
+        "_mcp_list_resource_templates": "_list_resource_templates_mcp",
+    }
+    for legacy_name, current_name in compat_aliases.items():
+        if not hasattr(mcp, legacy_name) and hasattr(mcp, current_name):
+            setattr(mcp, legacy_name, getattr(mcp, current_name))
 
     return mcp
 

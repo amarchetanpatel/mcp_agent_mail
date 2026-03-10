@@ -57,7 +57,7 @@ class ProductProjectLink(SQLModel, table=True):
 
 class Agent(SQLModel, table=True):
     __tablename__ = "agents"
-    __table_args__ = (UniqueConstraint("name", name="uq_agent_name_global"),)
+    __table_args__ = (UniqueConstraint("project_id", "name", name="uq_agent_project_name"),)
 
     id: Optional[int] = Field(default=None, primary_key=True)
     project_id: int = Field(foreign_key="projects.id", index=True)

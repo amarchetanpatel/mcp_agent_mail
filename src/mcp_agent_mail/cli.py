@@ -2319,6 +2319,9 @@ def archive_restore_state(
         ),
     ] = False,
 ) -> None:
+    # Force the next DB access to reopen against the restored snapshot rather
+    # than a pooled connection pointing at the pre-restore file.
+    reset_database_state()
     try:
         archive_path = _resolve_archive_path(archive_file)
     except FileNotFoundError as exc:
@@ -2398,6 +2401,7 @@ def archive_restore_state(
         shutil.copy2(snapshot_src, database_path)
         storage_root.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(storage_src, storage_root, dirs_exist_ok=False)
+    reset_database_state()
     console.print(f"[green]✓ Restore complete from {archive_path}.[/]")
     if backup_paths:
         console.print("[dim]Backups preserved at:[/]")
