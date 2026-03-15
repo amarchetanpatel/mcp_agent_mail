@@ -2058,7 +2058,7 @@ Common variables you may set:
 | `HTTP_CORS_ALLOW_METHODS` | `*` | CSV of allowed methods or `*` |
 | `HTTP_CORS_ALLOW_HEADERS` | `*` | CSV of allowed headers or `*` |
 | `HTTP_BEARER_TOKEN` |  | Static bearer token (only when JWT disabled) |
-| `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` | `true` | Allow localhost requests without auth (dev convenience) |
+| `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` | `false` | Allow localhost requests without auth. **OFF by default. Use `DANGEROUS_ALLOW_LOCALHOST_BYPASS=true` to enable explicitly.** |
 | `HTTP_OTEL_ENABLED` | `false` | Enable OpenTelemetry instrumentation |
 | `OTEL_SERVICE_NAME` | `mcp-agent-mail` | Service name for telemetry |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` |  | OTLP exporter endpoint URL |

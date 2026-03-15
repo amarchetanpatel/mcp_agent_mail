@@ -355,7 +355,9 @@ class SecurityAndRateLimitMiddleware:
                         jwks = (await client.get(jwks_url)).json()
                     key_set = JsonWebKey.import_key_set(jwks)
                     kid = header.get("kid")
-                    key = key_set.find_by_kid(kid) if kid else key_set.keys[0]
+                    if not kid:
+                        return None  # B-006: reject tokens without kid header
+                    key = key_set.find_by_kid(kid)
             elif secret:
                 with contextlib.suppress(Exception):
                     key = JsonWebKey.import_key(secret, {"kty": "oct"})

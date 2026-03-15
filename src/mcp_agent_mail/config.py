@@ -333,7 +333,11 @@ def get_settings() -> Settings:
             "HTTP_RBAC_READONLY_TOOLS",
             default="health_check,fetch_inbox,whois,search_messages,summarize_thread",
         ),
-        allow_localhost_unauthenticated=_bool(_decouple_config("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", default="true"), default=True),
+        # B-006: Localhost auth bypass OFF by default. Requires explicit dangerous opt-in.
+        allow_localhost_unauthenticated=_bool(
+            _decouple_config("DANGEROUS_ALLOW_LOCALHOST_BYPASS",
+                             default=_decouple_config("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", default="false")),
+            default=False),
     )
 
     database_settings = DatabaseSettings(
