@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import base64
 import contextlib
 import hmac
@@ -611,9 +612,11 @@ class SecurityAndRateLimitMiddleware:
 
 
 async def readiness_check() -> None:
-    await ensure_schema()
+    # B-005/F-014: read-only probe. Do NOT call ensure_schema() here —
+    # it is a write operation (DDL) that should not run on readiness probes.
+    # ensure_schema() already runs in _startup().
     async with get_session() as session:
-        await session.execute(text("SELECT 1"))
+        await session.execute(text("SELECT 1 FROM agents LIMIT 0"))
 
 
 def build_http_app(settings: Settings, server=None) -> FastAPI:
@@ -828,6 +831,22 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                                                     },
                                                                 )
                                         async with get_session() as s2:
+                                            # B-005/F-016: check for existing active reservation before inserting
+                                            existing_claim = await s2.execute(
+                                                text(
+                                                    """
+                                                SELECT id FROM file_reservations
+                                                WHERE project_id = :pid AND agent_id = :holder
+                                                  AND path_pattern = :pattern AND reason = 'ack-overdue'
+                                                  AND expires_ts > :now
+                                                LIMIT 1
+                                                """
+                                                ),
+                                                {"pid": project_id, "holder": holder_agent_id, "pattern": pattern, "now": now_naive},
+                                            )
+                                            if existing_claim.fetchone():
+                                                # Active reservation already exists — skip duplicate
+                                                continue
                                             await s2.execute(
                                                 text(
                                                     """
@@ -1032,14 +1051,25 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         tasks = []
         # FD health monitor always runs - it's critical for preventing EMFILE cascades
         tasks.append(asyncio.create_task(_worker_fd_health()))
-        if settings.file_reservations_cleanup_enabled:
-            tasks.append(asyncio.create_task(_worker_cleanup()))
-        if settings.ack_ttl_enabled:
-            tasks.append(asyncio.create_task(_worker_ack_ttl()))
-        if settings.tool_metrics_emit_enabled:
-            tasks.append(asyncio.create_task(_worker_tool_metrics()))
-        if settings.retention_report_enabled or settings.quota_enabled:
-            tasks.append(asyncio.create_task(_worker_retention_quota()))
+
+        # B-005/F-015: Only start maintenance tasks if this process is the maintenance leader.
+        # In multi-worker deployments (--workers N), set MAINTENANCE_LEADER=false on non-leader
+        # workers to prevent N copies of cleanup/ack/metrics/retention running concurrently.
+        _maintenance_leader = os.environ.get("MAINTENANCE_LEADER", "true").lower() in ("true", "1", "yes")
+        if not _maintenance_leader:
+            structlog.get_logger("startup").info("maintenance_skipped", reason="MAINTENANCE_LEADER=false")
+        else:
+            if settings.file_reservations_cleanup_enabled:
+                tasks.append(asyncio.create_task(_worker_cleanup()))
+            if settings.ack_ttl_enabled:
+                tasks.append(asyncio.create_task(_worker_ack_ttl()))
+            if settings.tool_metrics_emit_enabled:
+                tasks.append(asyncio.create_task(_worker_tool_metrics()))
+            if settings.retention_report_enabled or settings.quota_enabled:
+                tasks.append(asyncio.create_task(_worker_retention_quota()))
+            structlog.get_logger("startup").info("maintenance_started",
+                tasks=[t.get_name() for t in tasks if t.get_name() != "Task-1"])
+
         fastapi_app.state._background_tasks = tasks
 
     async def _shutdown() -> None:  # pragma: no cover - service lifecycle
