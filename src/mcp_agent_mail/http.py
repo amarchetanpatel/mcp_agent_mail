@@ -42,6 +42,7 @@ from .config import Settings, get_settings
 from .db import ensure_schema, get_session
 from .storage import (
     archive_write_lock,
+    cleanup_leaked_lockfile_fds,
     collect_lock_status,
     ensure_archive,
     get_agent_communication_graph,
@@ -51,6 +52,7 @@ from .storage import (
     get_fd_usage,
     get_file_content,
     get_historical_inbox_snapshot,
+    get_lock_telemetry,
     get_message_commit_sha,
     get_recent_commits,
     get_repo_cache_stats,
@@ -618,6 +620,20 @@ async def readiness_check() -> None:
     async with get_session() as session:
         await session.execute(text("SELECT 1 FROM agents LIMIT 0"))
 
+    # Fail readiness if FD usage from lockfile leaks is critically high.
+    # This gives orchestrators a signal to restart the process before it
+    # becomes completely wedged (issue #116).
+    current, limit = get_fd_usage()
+    if current >= 0 and limit > 0:
+        headroom_pct = (limit - current) / limit
+        if headroom_pct < 0.10:
+            lock_stats = get_lock_telemetry()
+            raise RuntimeError(
+                f"FD exhaustion imminent: {current}/{limit} FDs in use "
+                f"({round(headroom_pct * 100, 1)}% headroom). "
+                f"Lock telemetry: {lock_stats}"
+            )
+
 
 def build_http_app(settings: Settings, server=None) -> FastAPI:
     # Configure logging once
@@ -990,9 +1006,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             the EMFILE -> socket closed -> unreachable cascade that occurs
             under sustained multi-agent load.
 
+            Also monitors lockfile FD leaks (issue #116) and cleans up
+            deleted-but-open .lock file descriptors.
+
             Thresholds:
             - 30% headroom: warning logged
-            - 20% headroom: proactive cleanup triggered
+            - 20% headroom: proactive cleanup triggered (includes lockfile FDs)
             - 15% headroom: error logged, aggressive cleanup
             """
             _fd_logger = structlog.get_logger("fd_health")
@@ -1002,6 +1021,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     if current >= 0 and limit > 0:
                         headroom_pct = (limit - current) / limit
                         cache_stats = get_repo_cache_stats()
+                        lock_stats = get_lock_telemetry()
 
                         if headroom_pct < 0.15:
                             # Critical: aggressive cleanup
@@ -1011,6 +1031,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 fd_limit=limit,
                                 headroom_pct=round(headroom_pct * 100, 1),
                                 repo_cache=cache_stats,
+                                lock_telemetry=lock_stats,
                             )
                             freed = proactive_fd_cleanup(threshold=limit)
                             if freed:
@@ -1027,6 +1048,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 fd_limit=limit,
                                 headroom_pct=round(headroom_pct * 100, 1),
                                 repo_cache=cache_stats,
+                                lock_telemetry=lock_stats,
                             )
                             freed = proactive_fd_cleanup(threshold=int(limit * 0.25))
                             if freed:
@@ -1043,6 +1065,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 fd_limit=limit,
                                 headroom_pct=round(headroom_pct * 100, 1),
                                 repo_cache=cache_stats,
+                                lock_telemetry=lock_stats,
                             )
                 except Exception:
                     pass
