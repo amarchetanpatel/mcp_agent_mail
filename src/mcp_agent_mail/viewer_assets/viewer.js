@@ -364,6 +364,17 @@ async function loadDatabaseBytes(manifest) {
   }
 
   const network = await fetchDatabaseFromNetwork(manifest);
+  // B-007: Verify database integrity against manifest SHA256
+  if (sha) {
+    const digest = await crypto.subtle.digest("SHA-256", network.bytes);
+    const hex = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
+    if (hex !== sha) {
+      throw new Error(
+        `Database integrity check failed: expected sha256 ${sha.slice(0, 16)}…, got ${hex.slice(0, 16)}…`
+      );
+    }
+    console.info("[viewer] Database integrity verified", { sha256: sha.slice(0, 16) });
+  }
   state.lastDatabaseBytes = network.bytes;
   state.databaseSource = network.source;
   if (state.cacheState !== "opfs") {

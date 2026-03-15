@@ -4,8 +4,11 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- B-007: Tightened CSP — vendored Alpine+Lucide, removed wildcard connect-src,
+       removed stale CDN allowlist entries. Tailwind CDN + unsafe-inline/eval retained
+       (Tailwind Play CDN is a JIT compiler requiring both; removal requires a build pipeline). -->
   <meta http-equiv="Content-Security-Policy"
-    content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://cdn.jsdelivr.net https://unpkg.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net https://unpkg.com https://cdnjs.cloudflare.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src *; object-src 'none'; base-uri 'self';" />
+    content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self';" />
   <title>Agent Mail Viewer</title>
   <!-- Static Viewer: compatibility marker for legacy tests -->
 
@@ -109,7 +112,8 @@
   <!-- Alpine.js will be loaded after our controllers at the end of body -->
 
   <!-- Lucide Icons -->
-  <script src="https://unpkg.com/lucide@latest"></script>
+  <script src="./vendor/lucide.min.js" integrity="sha256-XeT//dwbQa0SJtXphvzFUq24rZ79FWbnHf3NtmT5psI="
+    crossorigin="anonymous"></script>
 
   <!-- Marked.js for markdown rendering -->
   <script src="./vendor/marked.min.js" integrity="sha256-iiOIwxmH8YPwUHaWKofAvi6NTUI9pec6g05elbtCB+8="
@@ -1230,7 +1234,8 @@
   <script type="module" src="./preview-reload.js"></script>
   <script src="./viewer.js"></script>
   <!-- Load Alpine AFTER viewer.js so controllers exist before Alpine scans -->
-  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js" defer></script>
+  <script src="./vendor/alpine.min.js" integrity="sha256-NY2a+7GrW++i9IBhowd25bzXcH9BCmBrqYX5i8OxwDQ="
+    crossorigin="anonymous" defer></script>
 
   <script>
     // Initialize Lucide icons
