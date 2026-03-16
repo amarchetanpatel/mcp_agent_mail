@@ -2126,6 +2126,13 @@ async def _ensure_project(human_key: str) -> Project:
                 result = await session.execute(select(Project).where(Project.slug == slug))
                 project = result.scalars().first()
                 if project:
+                    if project.archived_at is not None:
+                        import logging as _logging
+                        _logging.getLogger("mcp_agent_mail").warning(
+                            "Project '%s' (slug=%s) was archived (adopted into another project). "
+                            "Returning archived record to prevent split-state recreation.",
+                            human_key, slug,
+                        )
                     return project
                 project = Project(slug=slug, human_key=human_key)
                 session.add(project)

@@ -45,7 +45,7 @@ from sqlalchemy.sql import ColumnElement
 
 from .app import _sanitize_fts_query, build_mcp_server
 from .config import get_settings, resolve_env_file_path
-from .db import ensure_schema, get_session, reset_database_state
+from .db import ensure_schema, get_session, init_engine, reset_database_state
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
 from .http import build_http_app
 from .models import Agent, AgentLink, FileReservation, Message, MessageRecipient, MessageSummary, Product, ProductProjectLink, Project, ProjectSiblingSuggestion, WindowIdentity
@@ -3833,15 +3833,42 @@ def projects_adopt(
             dup = sorted(set(src_agents).intersection(set(dst_agents)))
             if dup:
                 raise typer.BadParameter(f"Agent name conflicts in target project: {', '.join(dup)}")
-        # Move Git artifacts
+
+        # --- Step 1: Re-key ALL database tables atomically (before file moves) ---
+        from sqlalchemy import update as _update
+        async with get_session() as session:
+            # Tables with simple project_id column
+            await session.execute(_update(Agent).where(cast(ColumnElement[bool], Agent.project_id == src.id)).values(project_id=dst.id))
+            await session.execute(_update(Message).where(cast(ColumnElement[bool], Message.project_id == src.id)).values(project_id=dst.id))
+            await session.execute(_update(FileReservation).where(cast(ColumnElement[bool], FileReservation.project_id == src.id)).values(project_id=dst.id))
+            await session.execute(_update(ProductProjectLink).where(cast(ColumnElement[bool], ProductProjectLink.project_id == src.id)).values(project_id=dst.id))
+            await session.execute(_update(WindowIdentity).where(cast(ColumnElement[bool], WindowIdentity.project_id == src.id)).values(project_id=dst.id))
+            await session.execute(_update(MessageSummary).where(cast(ColumnElement[bool], MessageSummary.project_id == src.id)).values(project_id=dst.id))
+            # AgentLink has two project_id columns (a and b sides)
+            await session.execute(_update(AgentLink).where(cast(ColumnElement[bool], AgentLink.a_project_id == src.id)).values(a_project_id=dst.id))
+            await session.execute(_update(AgentLink).where(cast(ColumnElement[bool], AgentLink.b_project_id == src.id)).values(b_project_id=dst.id))
+            # ProjectSiblingSuggestion has two project columns
+            await session.execute(_update(ProjectSiblingSuggestion).where(cast(ColumnElement[bool], ProjectSiblingSuggestion.project_a_id == src.id)).values(project_a_id=dst.id))
+            await session.execute(_update(ProjectSiblingSuggestion).where(cast(ColumnElement[bool], ProjectSiblingSuggestion.project_b_id == src.id)).values(project_b_id=dst.id))
+            # ThreadOwnership
+            from .models import ThreadOwnership
+            await session.execute(_update(ThreadOwnership).where(cast(ColumnElement[bool], ThreadOwnership.project_id == src.id)).values(project_id=dst.id))
+            # Archive the source project to prevent split-state recreation (F-021)
+            await session.execute(
+                _update(Project).where(cast(ColumnElement[bool], Project.id == src.id)).values(
+                    archived_at=datetime.now(timezone.utc).replace(tzinfo=None)
+                )
+            )
+            await session.commit()
+        console.print("[green]Database re-keyed (all tables) and source project archived.[/]")
+
+        # --- Step 2: Move Git artifacts (after DB is consistent) ---
         settings = get_settings()
-        # local import to minimize top-level churn and keep ordering stable
         from .storage import AsyncFileLock as _AsyncFileLock, ensure_archive as _ensure_archive
         src_archive = _run_async(_ensure_archive(settings, src.slug))
         dst_archive = _run_async(_ensure_archive(settings, dst.slug))
         moved_relpaths: list[str] = []
         for path_item in sorted(src_archive.root.rglob("*"), key=str):
-            # rglob returns Path objects at runtime; cast for type checker
             path = cast(Path, path_item)
             if not path.is_file():
                 continue
@@ -3855,16 +3882,14 @@ def projects_adopt(
             await asyncio.to_thread(path.replace, dest_path)
             moved_relpaths.append(dest_path.relative_to(dst_archive.repo_root).as_posix())
         from .storage import _commit as _archive_commit
-        async with _AsyncFileLock(dst_archive.lock_path):
-            await _archive_commit(dst_archive.repo, settings, f"adopt: move {src.slug} into {dst.slug}", moved_relpaths)
-        # Re-key database rows (agents, messages, file_reservations)
-        async with get_session() as session:
-            from sqlalchemy import update as _update  # local import to avoid top-of-file churn
-            await session.execute(_update(Agent).where(cast(ColumnElement[bool], Agent.project_id == src.id)).values(project_id=dst.id))
-            await session.execute(_update(Message).where(cast(ColumnElement[bool], Message.project_id == src.id)).values(project_id=dst.id))
-            await session.execute(_update(FileReservation).where(cast(ColumnElement[bool], FileReservation.project_id == src.id)).values(project_id=dst.id))
-            await session.commit()
-        # Write aliases.json under target
+        if moved_relpaths:
+            async with _AsyncFileLock(dst_archive.lock_path):
+                await _archive_commit(dst_archive.repo, settings, f"adopt: move {src.slug} into {dst.slug}", moved_relpaths)
+            console.print(f"[green]Moved {len(moved_relpaths)} file(s) to target archive.[/]")
+        else:
+            console.print("[dim]No archive files to move.[/]")
+
+        # --- Step 3: Write aliases.json under target ---
         aliases_path = dst_archive.root / "aliases.json"
         try:
             existing = {}
@@ -3872,10 +3897,13 @@ def projects_adopt(
                 existing = json.loads(aliases_path.read_text(encoding="utf-8"))
             former = set(existing.get("former_slugs", []))
             former.add(src.slug)
+            former.add(src.human_key)
             existing["former_slugs"] = sorted(former)
+            existing["canonical_slug"] = dst.slug
             await asyncio.to_thread(aliases_path.write_text, json.dumps(existing, indent=2), "utf-8")
             rel_alias = aliases_path.relative_to(dst_archive.repo_root).as_posix()
-            await _archive_commit(dst_archive.repo, settings, f"adopt: record alias for {src.slug}", [rel_alias])
+            async with _AsyncFileLock(dst_archive.lock_path):
+                await _archive_commit(dst_archive.repo, settings, f"adopt: record alias for {src.slug}", [rel_alias])
         except Exception as exc:
             console.print(f"[yellow]Warning: failed to write aliases.json: {exc}[/]")
 
@@ -4615,22 +4643,62 @@ def doctor_check(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed diagnostic output"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ) -> None:
-    """Run comprehensive diagnostics on mailbox and agent state.
+    """Run read-only diagnostics on mailbox and agent state.
 
     Checks:
     - Lock files (stale archive/commit locks)
-    - Database integrity (FK constraints, FTS index, orphaned records)
-    - Archive-DB synchronization
-    - File reservations (expired, conflicts)
-    - Attachments (orphaned files/manifests)
+    - Database integrity (PRAGMA integrity_check)
+    - Orphaned records (message recipients with no agent)
+    - FTS index consistency (message count vs FTS entry count)
+    - File reservations (expired, pending cleanup)
+    - WAL/SHM journal files
     """
 
     async def _run() -> list[DiagnosticResult]:
         from .db import get_database_path
 
         settings = get_settings()
-        await ensure_schema()
+        init_engine(settings)
         results: list[DiagnosticResult] = []
+
+        # Resolve project if specified (used to scope queries)
+        # Inline lookup to avoid _get_project_record which calls ensure_schema
+        project_record: Project | None = None
+        if project:
+            try:
+                raw_id = project.strip()
+                canonical_id = raw_id
+                try:
+                    candidate = Path(raw_id).expanduser()
+                    if candidate.is_absolute():
+                        canonical_id = str(candidate.resolve())
+                except Exception:
+                    pass
+                slug = slugify(canonical_id)
+                async with get_session() as session:
+                    stmt = select(Project).where(
+                        or_(
+                            cast(ColumnElement[bool], Project.slug == slug),
+                            cast(ColumnElement[bool], Project.human_key == canonical_id),
+                            cast(ColumnElement[bool], Project.human_key == raw_id),
+                        )
+                    )
+                    result = await session.execute(stmt)
+                    project_record = result.scalars().first()
+                if not project_record:
+                    results.append(DiagnosticResult(
+                        name="Project",
+                        status="error",
+                        message=f"Project '{project}' not found",
+                    ))
+                    return results
+            except Exception as exc:
+                results.append(DiagnosticResult(
+                    name="Project",
+                    status="error",
+                    message=f"Could not resolve project '{project}': {exc}",
+                ))
+                return results
 
         # Check 1: Stale locks
         from .storage import collect_lock_status
@@ -4690,13 +4758,23 @@ def doctor_check(
             ))
 
         # Check 3: Orphaned records
-        async with get_session() as session:
+        try:
+          async with get_session() as session:
             # Count orphaned message recipients (no agent)
-            orphan_query = text("""
-                SELECT COUNT(*) FROM message_recipients mr
-                WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = mr.agent_id)
-            """)
-            result = await session.execute(orphan_query)
+            if project_record:
+                orphan_query = text("""
+                    SELECT COUNT(*) FROM message_recipients mr
+                    JOIN messages m ON m.id = mr.message_id
+                    WHERE m.project_id = :pid
+                      AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = mr.agent_id)
+                """)
+                result = await session.execute(orphan_query, {"pid": project_record.id})
+            else:
+                orphan_query = text("""
+                    SELECT COUNT(*) FROM message_recipients mr
+                    WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = mr.agent_id)
+                """)
+                result = await session.execute(orphan_query)
             orphan_count = result.scalar() or 0
             if orphan_count > 0:
                 results.append(DiagnosticResult(
@@ -4713,12 +4791,22 @@ def doctor_check(
                 ))
 
             # Check 4: FTS index consistency
-            fts_query = text("""
-                SELECT
-                    (SELECT COUNT(*) FROM messages) as msg_count,
-                    (SELECT COUNT(*) FROM fts_messages) as fts_count
-            """)
-            result = await session.execute(fts_query)
+            if project_record:
+                fts_query = text("""
+                    SELECT
+                        (SELECT COUNT(*) FROM messages WHERE project_id = :pid) as msg_count,
+                        (SELECT COUNT(*) FROM fts_messages fm
+                         JOIN messages m ON m.rowid = fm.rowid
+                         WHERE m.project_id = :pid) as fts_count
+                """)
+                result = await session.execute(fts_query, {"pid": project_record.id})
+            else:
+                fts_query = text("""
+                    SELECT
+                        (SELECT COUNT(*) FROM messages) as msg_count,
+                        (SELECT COUNT(*) FROM fts_messages) as fts_count
+                """)
+                result = await session.execute(fts_query)
             counts = result.fetchone()
             if counts:
                 msg_count, fts_count = counts
@@ -4739,12 +4827,13 @@ def doctor_check(
             # Check 5: Expired file reservations
             # Use naive UTC datetime for consistency with how FileReservation stores timestamps
             now = datetime.now(timezone.utc).replace(tzinfo=None)
-            expired_query = select(func.count()).select_from(FileReservation).where(
-                and_(
-                    cast(ColumnElement[bool], cast(Any, FileReservation.released_ts).is_(None)),
-                    cast(ColumnElement[bool], cast(Any, FileReservation.expires_ts) < now),
-                )
-            )
+            conditions = [
+                cast(ColumnElement[bool], cast(Any, FileReservation.released_ts).is_(None)),
+                cast(ColumnElement[bool], cast(Any, FileReservation.expires_ts) < now),
+            ]
+            if project_record:
+                conditions.append(cast(ColumnElement[bool], cast(Any, FileReservation.project_id) == project_record.id))
+            expired_query = select(func.count()).select_from(FileReservation).where(and_(*conditions))
             result = await session.execute(expired_query)
             expired_count = result.scalar() or 0
             if expired_count > 0:
@@ -4759,6 +4848,20 @@ def doctor_check(
                     name="File Reservations",
                     status="ok",
                     message="No expired reservations",
+                ))
+        except Exception as e:
+            err_msg = str(e)
+            if "no such table" in err_msg:
+                results.append(DiagnosticResult(
+                    name="Schema",
+                    status="error",
+                    message="Database schema not initialized. Start the server first to create tables.",
+                ))
+            else:
+                results.append(DiagnosticResult(
+                    name="Database Queries",
+                    status="error",
+                    message=f"Query checks failed: {e}",
                 ))
 
         # Check 6: WAL/journal files
@@ -4822,7 +4925,9 @@ def doctor_check(
     console.print("=" * 50)
 
     if project:
-        console.print(f"Project: {project}\n")
+        console.print(f"Scope: project [bold]{project}[/bold]\n")
+    else:
+        console.print("Scope: all projects\n")
 
     table = Table(show_header=True)
     table.add_column("Check", style="bold")
