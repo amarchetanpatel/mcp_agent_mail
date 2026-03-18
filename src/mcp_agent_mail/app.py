@@ -3912,6 +3912,7 @@ async def _list_inbox(
             .where(
                 cast(Any, Message.project_id) == project.id,
                 MessageRecipient.agent_id == agent.id,
+                MessageRecipient.ack_ts.is_(None),
             )
             .order_by(desc(Message.created_ts))
             .limit(limit)
