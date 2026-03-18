@@ -7,6 +7,7 @@ import asyncio
 import os
 import base64
 import contextlib
+from dataclasses import is_dataclass, asdict
 import hmac
 import importlib
 import json
@@ -29,6 +30,7 @@ from sqlalchemy.exc import NoResultFound
 from sqlalchemy.engine import make_url
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import ASGIApp, Receive, Scope, Send
+from mcp.server.lowlevel.helper_types import ReadResourceContents
 
 from .app import (
     _expire_stale_file_reservations,
@@ -1322,8 +1324,19 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return None
 
     def _json_ready(value: Any) -> Any:
+        if isinstance(value, ReadResourceContents):
+            payload: dict[str, Any] = {}
+            if value.mime_type is not None:
+                payload["mimeType"] = value.mime_type
+            if isinstance(value.content, bytes):
+                payload["blob"] = base64.b64encode(value.content).decode("ascii")
+            else:
+                payload["text"] = value.content
+            return payload
         if hasattr(value, "model_dump"):
             return value.model_dump(mode="json", exclude_none=True)
+        if is_dataclass(value):
+            return {str(k): _json_ready(v) for k, v in asdict(value).items()}
         if isinstance(value, list):
             return [_json_ready(item) for item in value]
         if isinstance(value, tuple):
@@ -1390,6 +1403,20 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             elif method == "tools/list":
                 result = {"tools": _json_ready(await server._list_tools_mcp())}  # type: ignore[attr-defined]
             elif method == "ping":
+                result = {}
+            elif method == "initialize":
+                result = {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "tools": {"listChanged": False},
+                        "resources": {"subscribe": False, "listChanged": False},
+                    },
+                    "serverInfo": {
+                        "name": "mcp-agent-mail",
+                        "version": "1.0.0",
+                    },
+                }
+            elif method == "notifications/initialized":
                 result = {}
             else:
                 return JSONResponse(
