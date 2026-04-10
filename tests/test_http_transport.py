@@ -58,6 +58,7 @@ async def test_http_bearer_and_cors_preflight(isolated_env, monkeypatch):
 @pytest.mark.asyncio
 async def test_http_jwks_validation_and_resource_rate_limit(isolated_env, monkeypatch):
     # Configure JWT with JWKS and strict resource rate limit
+    monkeypatch.setenv("HTTP_BEARER_TOKEN", "")
     monkeypatch.setenv("HTTP_JWT_ENABLED", "true")
     monkeypatch.setenv("HTTP_JWT_ALGORITHMS", "RS256")
     monkeypatch.setenv("HTTP_RBAC_ENABLED", "true")
@@ -129,6 +130,39 @@ async def test_http_path_mount_trailing_and_no_slash(isolated_env):
 
 
 @pytest.mark.asyncio
+async def test_http_resources_read_serializes_lowlevel_resource_contents(isolated_env, monkeypatch):
+    monkeypatch.setenv("HTTP_BEARER_TOKEN", "")
+    monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true")
+    with contextlib.suppress(Exception):
+        _config.clear_settings_cache()
+    server = build_mcp_server()
+    settings = _config.get_settings()
+    app = build_http_app(settings, server)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            settings.http.path,
+            json=_rpc("resources/read", {"uri": "resource://tooling/directory"}),
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "error" not in payload
+
+    contents = payload["result"]["contents"]
+    assert isinstance(contents, list) and contents
+
+    first = contents[0]
+    assert first["uri"] == "resource://tooling/directory"
+    assert first["mimeType"] == "application/json"
+
+    decoded = json.loads(first["text"])
+    assert "clusters" in decoded
+    assert "playbooks" in decoded
+
+
+@pytest.mark.asyncio
 async def test_http_readiness_endpoint(isolated_env):
     server = build_mcp_server()
     settings = _config.get_settings()
@@ -140,7 +174,11 @@ async def test_http_readiness_endpoint(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_http_lock_status_endpoint(isolated_env):
+async def test_http_lock_status_endpoint(isolated_env, monkeypatch):
+    monkeypatch.setenv("HTTP_BEARER_TOKEN", "")
+    monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true")
+    with contextlib.suppress(Exception):
+        _config.clear_settings_cache()
     server = build_mcp_server()
     settings = _config.get_settings()
     app = build_http_app(settings, server)

@@ -908,6 +908,68 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     pass
                 await asyncio.sleep(settings.ack_ttl_scan_interval_seconds)
 
+        async def _worker_agent_reaper() -> None:
+            """Auto-retire agents inactive beyond configured TTL.
+
+            Runs every agent_reaper_interval_seconds (default 300s / 5min).
+            Agents whose last_active_ts is older than agent_reaper_inactivity_seconds
+            (default 7200s / 2h) are soft-retired: retired_at is set, moving them
+            from the active 'agents' array to 'retired_agents' in the directory
+            resource. They remain in the DB for audit and can be unretired via
+            macro_start_session (which clears retired_at on re-registration).
+            """
+            import datetime as _dt
+
+            _reaper_log = structlog.get_logger("agent_reaper")
+            while True:
+                try:
+                    await ensure_schema()
+                    cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(
+                        seconds=settings.agent_reaper_inactivity_seconds
+                    )
+                    cutoff_naive = cutoff.replace(tzinfo=None)
+                    now_naive = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+                    now_iso = now_naive.isoformat()
+                    cutoff_iso = cutoff_naive.isoformat()
+                    # Atomic: single UPDATE with staleness predicate in WHERE.
+                    # No TOCTOU — if a re-registration updates last_active_ts
+                    # between our check and the write, the WHERE excludes it.
+                    async with get_session() as session:
+                        # First, grab names for logging (read-only)
+                        result = await session.execute(
+                            text(
+                                "SELECT name FROM agents"
+                                " WHERE retired_at IS NULL"
+                                "   AND last_active_ts < :cutoff"
+                            ),
+                            {"cutoff": cutoff_iso},
+                        )
+                        stale_names = [r[0] for r in result.fetchall()]
+                        # Atomic retire — re-checks both predicates at write time
+                        if stale_names:
+                            retire_result = await session.execute(
+                                text(
+                                    "UPDATE agents SET retired_at = :now"
+                                    " WHERE retired_at IS NULL"
+                                    "   AND last_active_ts < :cutoff"
+                                ),
+                                {"now": now_iso, "cutoff": cutoff_iso},
+                            )
+                            await session.commit()
+                            retired_count = retire_result.rowcount
+                        else:
+                            retired_count = 0
+                    if retired_count:
+                        _reaper_log.info(
+                            "agents_auto_retired",
+                            retired_count=retired_count,
+                            retired_names=stale_names[:20],
+                            inactivity_threshold_s=settings.agent_reaper_inactivity_seconds,
+                        )
+                except Exception:
+                    pass
+                await asyncio.sleep(settings.agent_reaper_interval_seconds)
+
         async def _worker_tool_metrics() -> None:
             log = structlog.get_logger("tool.metrics")
             while True:
@@ -1090,6 +1152,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 tasks.append(asyncio.create_task(_worker_tool_metrics()))
             if settings.retention_report_enabled or settings.quota_enabled:
                 tasks.append(asyncio.create_task(_worker_retention_quota()))
+            if settings.agent_reaper_enabled:
+                tasks.append(asyncio.create_task(_worker_agent_reaper()))
             structlog.get_logger("startup").info("maintenance_started",
                 tasks=[t.get_name() for t in tasks if t.get_name() != "Task-1"])
 
@@ -1354,9 +1418,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async def elicit(self, *args: Any, **kwargs: Any) -> Any:
             return None
 
+    from mcp.server.lowlevel.helper_types import ReadResourceContents as _ReadResourceContents
+    from mcp.types import BlobResourceContents, TextResourceContents
+
     def _json_ready(value: Any) -> Any:
         if hasattr(value, "model_dump"):
-            return value.model_dump(mode="json", exclude_none=True)
+            return value.model_dump(mode="json", exclude_none=True, by_alias=True)
         if isinstance(value, list):
             return [_json_ready(item) for item in value]
         if isinstance(value, tuple):
@@ -1364,6 +1431,37 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         if isinstance(value, dict):
             return {str(k): _json_ready(v) for k, v in value.items()}
         return value
+
+    def _resource_content_block(uri: str, content: str | bytes, mime_type: str | None) -> dict[str, Any]:
+        if isinstance(content, bytes):
+            return BlobResourceContents(
+                uri=uri,
+                mimeType=mime_type,
+                blob=base64.b64encode(content).decode("ascii"),
+            ).model_dump(mode="json", exclude_none=True, by_alias=True)
+        return TextResourceContents(
+            uri=uri,
+            mimeType=mime_type,
+            text=content,
+        ).model_dump(mode="json", exclude_none=True, by_alias=True)
+
+    def _json_ready_resource_contents(uri: str, contents: Any) -> list[dict[str, Any]]:
+        items = contents if isinstance(contents, list) else [contents]
+        serialized: list[dict[str, Any]] = []
+        for item in items:
+            if isinstance(item, _ReadResourceContents):
+                serialized.append(_resource_content_block(uri, item.content, item.mime_type))
+                continue
+            if isinstance(item, (str, bytes)):
+                serialized.append(_resource_content_block(uri, item, None))
+                continue
+
+            normalized = _json_ready(item)
+            if isinstance(normalized, dict):
+                serialized.append(normalized)
+            else:
+                serialized.append(_resource_content_block(uri, str(normalized), None))
+        return serialized
 
     async def _dispatch_inprocess_jsonrpc(request: Request, payload: dict[str, Any]) -> JSONResponse:
         from mcp.server.lowlevel.server import request_ctx as _request_ctx
@@ -1415,7 +1513,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 uri = params.get("uri")
                 if not isinstance(uri, str):
                     raise ValueError("resources/read requires string uri")
-                result = {"contents": _json_ready(await server._read_resource_mcp(uri))}  # type: ignore[attr-defined]
+                result = {
+                    "contents": _json_ready_resource_contents(
+                        uri,
+                        await server._read_resource_mcp(uri),  # type: ignore[attr-defined]
+                    )
+                }
             elif method == "resources/templates/list":
                 result = {
                     "resourceTemplates": _json_ready(await server._list_resource_templates_mcp())  # type: ignore[attr-defined]
